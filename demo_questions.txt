@@ -1,0 +1,7 @@
+# InsightAnalyst Demo Questions
+# Used by warm_cache.py and check_demo.py for offline regression testing and presentation rehearsal.
+
+Why did sales drop in the South region last month?
+Which product categories drove the most revenue in Q3?
+What was our total units sold in September 2023?
+How many orders were placed by European customers last month?
