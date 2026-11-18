@@ -1,57 +1,65 @@
-# Metric Definitions for InsightAnalyst
-# Grounded business definitions embedded into ChromaDB to ensure consistent calculations.
+# knowledge/metrics.yaml
+# Defined metrics for InsightAnalyst text-to-SQL planning.
 
 metrics:
   revenue:
     name: "Revenue"
-    formula: "SUM(UnitPrice * Quantity * (1 - Discount))"
-    source_table: "[Order Details]"
-    grain: "order line item"
+    description: "Total dollar value of sales generated from purchased items after applying discounts."
+    synonyms:
+      - "sales"
+      - "total sales"
+      - "turnover"
+      - "dollar sales"
+      - "top line"
+    formula_sql: "SUM(od.UnitPrice * od.Quantity * (1 - od.Discount))"
+    grain: "order line item ([Order Details])"
     caveats:
-      - "Never include Freight in revenue calculation (Freight is a shipping cost)."
-      - "Always bracket [Order Details] due to the space in table name."
-      - "Join to Orders on OrderID to filter by OrderDate."
-      - "To prevent row duplication when calculating regional revenue, join Orders to Customers and dim_country_region; never join EmployeeTerritories or Region."
-    example_sql: |
-      SELECT SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) AS revenue
-      FROM [Order Details] od
-      JOIN Orders o ON od.OrderID = o.OrderID
-      WHERE o.OrderDate >= '1997-01-01' AND o.OrderDate <= '1997-01-31';
+      - "Revenue is calculated from [Order Details], never from Orders.Freight."
+      - "Freight is a shipping surcharge and must NEVER be included in revenue."
+      - "Always bracket [Order Details] because the table name contains a space."
+      - "Regional sales must join Orders -> Customers -> dim_country_region (never join EmployeeTerritories)."
+    example_question: "Why did sales drop in the South region last month?"
 
   units_sold:
     name: "Units Sold"
-    formula: "SUM(Quantity)"
-    source_table: "[Order Details]"
-    grain: "order line item"
+    description: "Total volume or quantity of physical product units sold."
+    synonyms:
+      - "volume"
+      - "quantity sold"
+      - "item volume"
+      - "total units"
+    formula_sql: "SUM(od.Quantity)"
+    grain: "order line item ([Order Details])"
     caveats:
-      - "Reflects the total volume of product units sold, regardless of price or discount."
-    example_sql: |
-      SELECT SUM(od.Quantity) AS units_sold
-      FROM [Order Details] od
-      JOIN Orders o ON od.OrderID = o.OrderID
-      WHERE o.OrderDate >= '1997-01-01' AND o.OrderDate <= '1997-01-31';
+      - "Represents physical unit volume, regardless of product unit price or discounts."
+      - "Requires joining [Order Details] to Orders for date or regional filtering."
+    example_question: "Which product category sold the most units in August 2023?"
 
   order_count:
     name: "Order Count"
-    formula: "COUNT(DISTINCT OrderID)"
-    source_table: "Orders"
-    grain: "order"
+    description: "Total number of completed distinct customer orders."
+    synonyms:
+      - "total orders"
+      - "number of orders"
+      - "order volume"
+      - "transactions"
+    formula_sql: "COUNT(DISTINCT o.OrderID)"
+    grain: "order (Orders)"
     caveats:
-      - "Use COUNT(DISTINCT o.OrderID) when joining with [Order Details] to prevent duplicate counts from line items."
-    example_sql: |
-      SELECT COUNT(DISTINCT o.OrderID) AS order_count
-      FROM Orders o
-      WHERE o.OrderDate >= '1997-01-01' AND o.OrderDate <= '1997-01-31';
+      - "Must always use COUNT(DISTINCT o.OrderID) when joining with [Order Details] to prevent duplicate counts from line items."
+    example_question: "How many orders were placed by European customers in September 2023?"
 
   average_order_value:
     name: "Average Order Value (AOV)"
-    formula: "SUM(UnitPrice * Quantity * (1 - Discount)) / COUNT(DISTINCT OrderID)"
-    source_table: "[Order Details] joined with Orders"
-    grain: "order"
+    description: "Average revenue generated per distinct customer order."
+    synonyms:
+      - "AOV"
+      - "average basket size"
+      - "average order size"
+      - "mean order revenue"
+    formula_sql: "(SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) * 1.0) / COUNT(DISTINCT o.OrderID)"
+    grain: "order header aggregated across line items"
     caveats:
-      - "Multiply by 1.0 to avoid integer division in SQLite."
-    example_sql: |
-      SELECT (SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) * 1.0) / COUNT(DISTINCT o.OrderID) AS aov
-      FROM [Order Details] od
-      JOIN Orders o ON od.OrderID = o.OrderID
-      WHERE o.OrderDate >= '1997-01-01' AND o.OrderDate <= '1997-01-31';
+      - "Multiply numerator by 1.0 to avoid SQLite integer division truncation."
+      - "Requires joining [Order Details] and Orders on OrderID."
+    example_question: "What was our average order value in the North region last month?"
