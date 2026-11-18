@@ -7,6 +7,7 @@ No LLM calls - 100% deterministic, traceable math.
 """
 
 from dataclasses import dataclass, field, asdict
+import re
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 import sys
 from pathlib import Path
@@ -110,14 +111,37 @@ def analyze_contribution(
     orig_cols = result.columns or []
     rows = result.rows
 
-    # Case A: Long format (3 columns where one is period/date/month)
+    # Case A1: Long format with dimension breakdown (3+ columns where one is period/date/month)
     period_idx = -1
+    time_terms = ["month", "ordermonth", "date", "orderdate", "period", "year", "quarter"]
     for i, c in enumerate(cols):
-        if any(term in c for term in ["month", "period", "date", "year", "quarter"]):
+        if any(term in c for term in time_terms):
             period_idx = i
             break
 
-    if period_idx != -1 and len(cols) == 3:
+    # Case A2: Aggregate two-period summary without dimension breakdown (e.g. [OrderMonth, Revenue])
+    if period_idx != -1 and len(cols) == 2:
+        unique_periods = sorted(list({str(r[period_idx]) for r in rows}))
+        if len(unique_periods) == 2:
+            val_idx = 1 if period_idx == 0 else 0
+            prior_p, curr_p = unique_periods[0], unique_periods[1]
+            p_val = _safe_float([r[val_idx] for r in rows if str(r[period_idx]) == prior_p][0])
+            c_val = _safe_float([r[val_idx] for r in rows if str(r[period_idx]) == curr_p][0])
+            tot_chg = c_val - p_val
+            tot_pct = (tot_chg / p_val * 100) if p_val != 0 else None
+            return ContributionAnalysis(
+                dimension_name=orig_cols[period_idx],
+                total_prior=p_val,
+                total_current=c_val,
+                total_change=tot_chg,
+                total_pct_change=tot_pct,
+                items=[],
+                is_reconciled=True,
+                reconciliation_error=0.0,
+                tolerance=tolerance
+            )
+
+    if period_idx != -1 and len(cols) >= 3:
         unique_periods = sorted(list({str(r[period_idx]) for r in rows}))
         if len(unique_periods) == 2:
             return _analyze_long_format(
@@ -135,6 +159,14 @@ def analyze_contribution(
 
     if dimension_col and dimension_col in orig_cols:
         dim_idx = orig_cols.index(dimension_col)
+    else:
+        # Avoid selecting time/date or id columns as the breakdown dimension
+        id_terms = ["id", "orderid", "customerid"]
+        for idx, c in enumerate(cols):
+            if not any(term in c for term in time_terms) and not any(term in c for term in id_terms):
+                dim_idx = idx
+                break
+
     if prior_col and prior_col in orig_cols:
         p_idx = orig_cols.index(prior_col)
     if current_col and current_col in orig_cols:
@@ -142,17 +174,21 @@ def analyze_contribution(
 
     dim_name = orig_cols[dim_idx] if dim_idx < len(orig_cols) else "dimension"
 
-    # Extract raw items, skipping synthetic 'total' rows if present
+    # Extract raw items, skipping synthetic 'total' rows and date strings
     raw_data = []
     found_total_prior = None
     found_total_current = None
+    date_pattern = re.compile(r"^\d{4}-\d{2}$|^\d{4}-\d{2}-\d{2}$")
 
     for r in rows:
-        dim_val = str(r[dim_idx]) if r[dim_idx] is not None else "Unknown"
+        dim_val = str(r[dim_idx]).strip() if dim_idx < len(r) and r[dim_idx] is not None else "Unknown"
         # If the query itself included a 'Total' roll-up row, capture it separately
-        if dim_val.strip().lower() in ["total", "all", "overall"]:
-            found_total_prior = _safe_float(r[p_idx])
-            found_total_current = _safe_float(r[c_idx])
+        if dim_val.lower() in ["total", "all", "overall", "summary"]:
+            found_total_prior = _safe_float(r[p_idx]) if p_idx < len(r) else None
+            found_total_current = _safe_float(r[c_idx]) if c_idx < len(r) else None
+            continue
+        # If dimension value is a date/month (time period), do not treat as an entity item
+        if date_pattern.match(dim_val):
             continue
         p_val = _safe_float(r[p_idx]) if p_idx < len(r) else 0.0
         c_val = _safe_float(r[c_idx]) if c_idx < len(r) else 0.0

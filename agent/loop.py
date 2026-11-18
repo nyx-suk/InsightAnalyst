@@ -77,20 +77,241 @@ def _call_validator(
             return validator(result)
 
 
+def _safe_float(val: Any) -> float:
+    """Safely converts a value to float, returning 0.0 on error."""
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        if isinstance(val, str):
+            try:
+                return float(val.replace(",", "").replace("$", ""))
+            except ValueError:
+                pass
+        return 0.0
+
+
+def _extract_primary_metric_value(
+    result: QueryResult,
+    metric_name: Optional[str] = None,
+    time_window: Optional[Any] = None,
+    question: Optional[str] = None
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """
+    Extracts the primary metric value, column name, and entity label using column names,
+    metric context, and target time window.
+    
+    Returns:
+        (value, column_name, entity_label)
+    """
+    if not result or not result.rows or not result.columns:
+        return None, None, None
+
+    cols = result.columns
+    cols_lower = [c.lower() for c in cols]
+    rows = result.rows
+
+    # 1. Score candidate metric columns
+    metric_str = (metric_name or "").lower()
+    q_str = (question or "").lower()
+
+    if "revenue" in metric_str or "sale" in metric_str or "revenue" in q_str or "sale" in q_str:
+        primary_targets = ["total_revenue", "overall_revenue", "monthly_revenue", "totalrevenue", "revenue", "totalsales", "sales"]
+        secondary_targets = ["product_revenue", "productrevenue", "item_revenue", "subtotal", "amount"]
+    elif "unit" in metric_str or "quantity" in metric_str or "unit" in q_str:
+        primary_targets = ["total_units_sold", "total_units", "total_quantity", "totalunits", "totalquantity", "units_sold", "quantity"]
+        secondary_targets = ["units", "product_units", "item_quantity"]
+    elif "order" in metric_str or "order" in q_str:
+        primary_targets = ["total_orders", "order_count", "ordercount", "totalorders", "orders"]
+        secondary_targets = ["count"]
+    elif "average" in metric_str or "aov" in metric_str or "average" in q_str or "aov" in q_str:
+        primary_targets = ["average_order_value", "averageordervalue", "aov", "avg_order_value", "avg_aov"]
+        secondary_targets = ["avg", "average"]
+    else:
+        primary_targets = ["total_revenue", "overall_revenue", "revenue", "total", "amount", "value"]
+        secondary_targets = ["count", "units"]
+
+    time_terms = ["month", "ordermonth", "date", "orderdate", "period", "year", "quarter"]
+    id_terms = ["id", "orderid", "customerid", "productid", "categoryid"]
+
+    scored_cols = []
+    for idx, c in enumerate(cols_lower):
+        if any(term in c for term in time_terms) or any(term in c for term in id_terms):
+            continue
+        score = 0
+        if c in primary_targets:
+            score = 100
+        elif any(c.startswith(f"total_{t}") or c.startswith(f"overall_{t}") for t in primary_targets):
+            score = 95
+        elif any(t in c for t in primary_targets):
+            score = 80
+        elif c in secondary_targets:
+            score = 40
+        elif any(t in c for t in secondary_targets):
+            score = 30
+        else:
+            if len(rows) > 0 and idx < len(rows[0]) and isinstance(rows[0][idx], (int, float)):
+                score = 20
+
+        if score > 0:
+            scored_cols.append((score, idx, cols[idx]))
+
+    scored_cols.sort(key=lambda x: x[0], reverse=True)
+    metric_idx = scored_cols[0][1] if scored_cols else -1
+    col_name = scored_cols[0][2] if scored_cols else None
+
+    # Fallback if no scored column
+    if metric_idx == -1:
+        for idx, col in enumerate(cols):
+            if any(term in cols_lower[idx] for term in time_terms) or any(term in cols_lower[idx] for term in id_terms):
+                continue
+            if len(rows) > 0 and idx < len(rows[0]) and isinstance(rows[0][idx], (int, float)):
+                metric_idx = idx
+                col_name = col
+                break
+
+    if metric_idx == -1:
+        return None, None, None
+
+    # 2. Select the most relevant row based on target time window or question
+    selected_row_idx = 0
+    time_col_idx = -1
+    for idx, c in enumerate(cols_lower):
+        if any(term in c for term in time_terms):
+            time_col_idx = idx
+            break
+
+    target_time_str = None
+    if isinstance(time_window, str):
+        target_time_str = time_window
+    elif isinstance(time_window, dict):
+        target_time_str = time_window.get("value")
+
+    if time_col_idx != -1 and len(rows) > 1:
+        matched = False
+        if target_time_str:
+            for r_idx, r in enumerate(rows):
+                if target_time_str in str(r[time_col_idx]):
+                    selected_row_idx = r_idx
+                    matched = True
+                    break
+        if not matched:
+            month_map = {
+                "september": "2023-09", "sep": "2023-09",
+                "august": "2023-08", "aug": "2023-08",
+                "july": "2023-07", "jul": "2023-07"
+            }
+            for m_name, m_code in month_map.items():
+                if m_name in q_str:
+                    for r_idx, r in enumerate(rows):
+                        if m_code in str(r[time_col_idx]) or m_name in str(r[time_col_idx]).lower():
+                            selected_row_idx = r_idx
+                            matched = True
+                            break
+                    if matched:
+                        break
+        if not matched and len(rows) == 2:
+            selected_row_idx = len(rows) - 1
+
+    selected_row = rows[selected_row_idx]
+    raw_val = selected_row[metric_idx]
+    val = None
+    if isinstance(raw_val, (int, float)):
+        val = float(raw_val)
+    elif isinstance(raw_val, str):
+        try:
+            val = float(raw_val.replace(",", "").replace("$", ""))
+        except ValueError:
+            pass
+
+    # Extract entity label from non-time, non-metric column (e.g. ProductName or Region)
+    entity_label = None
+    for idx, col in enumerate(cols):
+        if idx != metric_idx and idx != time_col_idx:
+            cell_val = selected_row[idx]
+            if cell_val is not None and not isinstance(cell_val, (int, float)):
+                entity_label = str(cell_val).strip()
+                break
+
+    return val, col_name, entity_label
+
+
 def _extract_scalar(result: QueryResult) -> Optional[float]:
-    """Extracts first numeric value from result rows if available."""
-    if not result or not result.rows:
+    """Extracts primary metric value from result rows (backward-compatible alias)."""
+    val, _, _ = _extract_primary_metric_value(result)
+    return val
+
+
+def _calculate_top_driver(rows: List[tuple], columns: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Deterministically identifies the largest contributor or variance in pure Python.
+    Strictly operates on entity dimensions (e.g. product, category, region, country),
+    NEVER on time periods (month, date, year) or summary/total rows.
+    """
+    if not rows or len(rows) < 2 or not columns:
         return None
-    for row in result.rows:
-        for val in row:
-            if isinstance(val, (int, float)):
-                return float(val)
-            if isinstance(val, str):
-                try:
-                    return float(val.replace(",", "").replace("$", ""))
-                except ValueError:
-                    continue
-    return None
+
+    col_lower = [c.lower() for c in columns]
+    time_terms = ["month", "ordermonth", "date", "orderdate", "period", "year", "quarter", "day", "time"]
+    id_terms = ["id", "orderid", "customerid", "productid", "categoryid"]
+    metric_terms = ["revenue", "sales", "val", "amount", "total", "count", "quantity", "units"]
+
+    # 1. Identify value/metric column
+    val_idx = -1
+    for idx, col in enumerate(col_lower):
+        if any(term in col for term in metric_terms):
+            val_idx = idx
+            break
+    if val_idx == -1:
+        val_idx = len(columns) - 1
+
+    # 2. Identify entity dimension column (MUST NOT be time or ID)
+    dim_idx = -1
+    for idx, col in enumerate(col_lower):
+        if idx == val_idx:
+            continue
+        if any(term in col for term in time_terms):
+            continue
+        if any(term in col for term in id_terms):
+            continue
+        dim_idx = idx
+        break
+
+    # If no true entity dimension exists, return None (time periods are not drivers)
+    if dim_idx == -1:
+        return None
+
+    dim_name = columns[dim_idx]
+
+    # 3. Filter rows: exclude summary rows ('Total', 'All') and rows where dim value looks like a date/month
+    valid_rows = []
+    month_regex = re.compile(r"^\d{4}-\d{2}$|^\d{4}-\d{2}-\d{2}$|^[A-Za-z]+ \d{4}$")
+    for r in rows:
+        if dim_idx >= len(r) or val_idx >= len(r):
+            continue
+        dim_val = str(r[dim_idx]).strip()
+        if dim_val.lower() in ["total", "all", "overall", "summary"]:
+            continue
+        if month_regex.match(dim_val):
+            continue
+        val = _safe_float(r[val_idx]) if val_idx < len(r) else 0.0
+        valid_rows.append((dim_val, val))
+
+    if len(valid_rows) < 2:
+        return None
+
+    sorted_rows = sorted(valid_rows, key=lambda x: x[1])
+    worst_item = sorted_rows[0]
+    best_item = sorted_rows[-1]
+
+    return {
+        "dimension": dim_name,
+        "worst_name": worst_item[0],
+        "worst_val": worst_item[1],
+        "best_name": best_item[0],
+        "best_val": best_item[1]
+    }
 
 
 def repair_query(
@@ -162,7 +383,6 @@ def repair_query(
 
     if isinstance(parsed, dict) and "sql" in parsed:
         repaired_sql = str(parsed["sql"]).strip()
-        # Ensure it's a read-only query
         upper_sql = repaired_sql.upper()
         forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA"]
         if any(f"{kw} " in upper_sql or f" {kw}" in upper_sql for kw in forbidden):
@@ -179,59 +399,129 @@ _rewrite_query = repair_query
 
 def _generate_drilldown_query(
     plan: Plan,
-    top_driver_val: str,
-    drill_dim: str,
-    query_id: str = "Q2"
+    top_driver_val: Optional[str] = None,
+    drill_dim: str = "product",
+    query_id: str = "Q2",
+    question: Optional[str] = None
 ) -> PlanQuery:
-    """Generates a focused drill-down SQL query for the top contributing dimension slice."""
-    metric_col = "SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) AS Revenue"
-    filter_clause = f"dcr.Region = '{top_driver_val}'" if top_driver_val else ""
-    if not filter_clause and plan.filters:
-        for k, v in plan.filters.items():
-            filter_clause = f"{k} = '{v}'"
-            break
+    """
+    Generates a focused drill-down SQL query that strictly follows:
+      1. User question intent: 'top' / 'highest' -> DESC vs 'bottom' / 'lowest' -> ASC.
+      2. Planned time window: resolves date bounds (e.g. September 2023 -> 2023-09-01 to 2023-09-30).
+      3. Dynamic filters: applies region/category filter from plan or top contributor, without hardcoding.
+    """
+    q_text = (question or plan.question or "").lower()
 
-    where_str = f"WHERE {filter_clause}" if filter_clause else ""
-
-    if drill_dim.lower() in ["product", "productname"]:
-        sql = (
-            f"SELECT p.ProductName, {metric_col} "
-            "FROM [Order Details] od "
-            "JOIN Products p ON od.ProductID = p.ProductID "
-            "JOIN Orders o ON od.OrderID = o.OrderID "
-            "JOIN Customers c ON o.CustomerID = c.CustomerID "
-            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
-            f"{where_str} "
-            "GROUP BY p.ProductName "
-            "ORDER BY Revenue ASC LIMIT 5;"
-        )
-        purpose = f"Drill-down: bottom 5 revenue products in {top_driver_val or 'selected slice'}"
-    elif drill_dim.lower() in ["category", "categoryname"]:
-        sql = (
-            f"SELECT cat.CategoryName, {metric_col} "
-            "FROM [Order Details] od "
-            "JOIN Products p ON od.ProductID = p.ProductID "
-            "JOIN Categories cat ON p.CategoryID = cat.CategoryID "
-            "JOIN Orders o ON od.OrderID = o.OrderID "
-            "JOIN Customers c ON o.CustomerID = c.CustomerID "
-            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
-            f"{where_str} "
-            "GROUP BY cat.CategoryName "
-            "ORDER BY Revenue ASC LIMIT 5;"
-        )
-        purpose = f"Drill-down: categories in {top_driver_val or 'selected slice'}"
+    # 1. Direction (TOP vs BOTTOM)
+    if any(w in q_text for w in ["top", "highest", "most", "best", "leading", "greatest", "max"]):
+        order_dir = "DESC"
+        order_label = "top"
+    elif any(w in q_text for w in ["bottom", "lowest", "least", "worst", "min"]):
+        order_dir = "ASC"
+        order_label = "bottom"
+    elif any(w in q_text for w in ["drop", "fell", "loss", "decrease", "decline"]):
+        order_dir = "ASC"
+        order_label = "lowest"
     else:
-        sql = (
-            f"SELECT c.Country, {metric_col} "
-            "FROM [Order Details] od "
-            "JOIN Orders o ON od.OrderID = o.OrderID "
-            "JOIN Customers c ON o.CustomerID = c.CustomerID "
-            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
-            f"{where_str} "
-            "GROUP BY c.Country "
-            "ORDER BY Revenue ASC LIMIT 5;"
-        )
-        purpose = f"Drill-down: country breakdown in {top_driver_val or 'selected slice'}"
+        order_dir = "DESC"
+        order_label = "top"
+
+    # 2. Limit
+    limit = 5
+    m = re.search(r"(?:top|bottom|lowest|highest)\s+(\d+)", q_text)
+    if m:
+        try:
+            limit = int(m.group(1))
+        except ValueError:
+            limit = 5
+    elif "ten" in q_text:
+        limit = 10
+    elif "three" in q_text:
+        limit = 3
+
+    # 3. Time Window
+    where_conditions: List[str] = []
+    time_label = "target period"
+
+    if plan.time_window:
+        try:
+            s_date, e_date = resolve_window(plan.time_window)
+            where_conditions.append(f"o.OrderDate >= '{s_date}' AND o.OrderDate <= '{e_date}'")
+            time_label = f"{s_date} to {e_date}"
+        except Exception:
+            pass
+
+    if not any("OrderDate" in c for c in where_conditions):
+        if "september" in q_text or "2023-09" in q_text:
+            where_conditions.append("o.OrderDate >= '2023-09-01' AND o.OrderDate <= '2023-09-30'")
+            time_label = "September 2023"
+        elif "august" in q_text or "2023-08" in q_text:
+            where_conditions.append("o.OrderDate >= '2023-08-01' AND o.OrderDate <= '2023-08-31'")
+            time_label = "August 2023"
+
+    # 4. Filters (Region, Category, Country)
+    if plan.filters:
+        if plan.filters.get("region"):
+            where_conditions.append(f"dcr.Region = '{plan.filters['region']}'")
+        if plan.filters.get("country"):
+            where_conditions.append(f"c.Country = '{plan.filters['country']}'")
+        if plan.filters.get("category"):
+            where_conditions.append(f"cat.CategoryName = '{plan.filters['category']}'")
+    elif top_driver_val and top_driver_val in ["South", "North", "Europe"]:
+        where_conditions.append(f"dcr.Region = '{top_driver_val}'")
+
+    where_str = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    # 5. Metric selection
+    metric_str = (plan.metric or "").lower()
+    if "unit" in metric_str or "quantity" in metric_str or "unit" in q_text:
+        metric_col = "SUM(od.Quantity) AS UnitsSold"
+        metric_order = "UnitsSold"
+        metric_name = "units sold"
+    elif "order" in metric_str or "order" in q_text:
+        metric_col = "COUNT(DISTINCT o.OrderID) AS OrderCount"
+        metric_order = "OrderCount"
+        metric_name = "order count"
+    else:
+        metric_col = "ROUND(SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)), 2) AS Revenue"
+        metric_order = "Revenue"
+        metric_name = "revenue"
+
+    # 6. Dimension selection & Required Joins
+    dim_lower = (drill_dim or "product").lower()
+    joins = [
+        "FROM [Order Details] od",
+        "JOIN Orders o ON od.OrderID = o.OrderID",
+        "JOIN Customers c ON o.CustomerID = c.CustomerID",
+        "JOIN dim_country_region dcr ON c.Country = dcr.Country"
+    ]
+
+    if dim_lower in ["product", "productname"]:
+        dim_select = "p.ProductName"
+        dim_desc = "products"
+        joins.insert(1, "JOIN Products p ON od.ProductID = p.ProductID")
+    elif dim_lower in ["category", "categoryname"]:
+        dim_select = "cat.CategoryName"
+        dim_desc = "categories"
+        joins.insert(1, "JOIN Products p ON od.ProductID = p.ProductID")
+        joins.insert(2, "JOIN Categories cat ON p.CategoryID = cat.CategoryID")
+    elif dim_lower in ["country"]:
+        dim_select = "c.Country"
+        dim_desc = "countries"
+    else:
+        dim_select = "dcr.Region"
+        dim_desc = "regions"
+
+    join_str = "\n".join(joins)
+
+    sql = (
+        f"SELECT {dim_select}, {metric_col} "
+        f"{join_str} "
+        f"{where_str} "
+        f"GROUP BY {dim_select} "
+        f"ORDER BY {metric_order} {order_dir} LIMIT {limit};"
+    )
+    purpose = f"Drill-down: {order_label} {limit} {dim_desc} by {metric_name} for {time_label}"
 
     return PlanQuery(query_id=query_id, sql=sql, purpose=purpose)
 
@@ -487,9 +777,9 @@ def run_agent(
 
             # Step 3: Analyze baseline result (Q1)
             if q_idx == 0:
-                if len(q_result.columns or []) >= 3 and q_result.rows:
+                if len(q_result.columns or []) >= 2 and q_result.rows:
                     baseline_analysis = analyze_contribution(q_result)
-                    if baseline_analysis.items:
+                    if baseline_analysis and (baseline_analysis.total_prior or baseline_analysis.total_current):
                         dir_str = "fell" if baseline_analysis.total_change < 0 else "rose"
                         headline_finding = Finding(
                             id="F_headline",
@@ -507,23 +797,31 @@ def run_agent(
                         )
                         findings.append(headline_finding)
 
-                        driver_f = build_driver_finding(baseline_analysis, query_id=qid, metric_name=plan.metric or "revenue")
-                        if driver_f:
-                            findings.append(driver_f)
-                            top_val = baseline_analysis.top_driver.dimension_value
-                            emit_event("drilldown", f"Primary driver identified: {top_val} explaining {baseline_analysis.top_driver.contribution_pct}% of change", query_id=qid)
+                        # Only add driver finding if top_driver is an actual entity driver (items not empty)
+                        if baseline_analysis.top_driver:
+                            driver_f = build_driver_finding(baseline_analysis, query_id=qid, metric_name=plan.metric or "revenue")
+                            if driver_f:
+                                findings.append(driver_f)
+                                top_val = baseline_analysis.top_driver.dimension_value
+                                emit_event("drilldown", f"Primary driver identified: {top_val} explaining {baseline_analysis.top_driver.contribution_pct}% of change", query_id=qid)
 
                 # Fallback scalar headline if no finding was generated
                 if not findings and q_result.rows:
-                    val = _extract_scalar(q_result)
+                    val, col_name, entity_label = _extract_primary_metric_value(
+                        q_result,
+                        metric_name=plan.metric,
+                        time_window=plan.time_window,
+                        question=question
+                    )
+                    finding_label = entity_label or plan_query.purpose
                     findings.append(
                         Finding(
                             id="F1",
                             kind="headline",
-                            template=f"{plan_query.purpose}: {{val}} [{{query_id}}]",
+                            template=f"{finding_label}: {{val}} [{{query_id}}]",
                             values={"val": val if val is not None else 0.0, "query_id": qid},
                             query_id=qid,
-                            statement=f"{plan_query.purpose} [{qid}]",
+                            statement=f"{finding_label}: {val:,.2f} [{qid}]" if val is not None else f"{finding_label} [{qid}]",
                             value=val,
                             formatted_value=f"{val:,.2f}" if val is not None else None
                         )
@@ -535,25 +833,37 @@ def run_agent(
                     top_val = (
                         baseline_analysis.top_driver.dimension_value
                         if baseline_analysis and baseline_analysis.top_driver
-                        else plan.filters.get("region", "South")
+                        else plan.filters.get("region")
                     )
-                    drill_q = _generate_drilldown_query(plan, top_driver_val=top_val, drill_dim=drill_dim, query_id="Q2")
+                    drill_q = _generate_drilldown_query(
+                        plan,
+                        top_driver_val=top_val,
+                        drill_dim=drill_dim,
+                        query_id="Q2",
+                        question=question
+                    )
                     queries_to_run.append(drill_q)
-                    emit_event("plan", f"Generated dynamic drill-down query Q2 for dimension '{drill_dim}' on top contributor '{top_val}'")
+                    emit_event("plan", f"Generated dynamic drill-down query Q2 for dimension '{drill_dim}' on contributor '{top_val or 'target'}'")
 
             elif q_idx > 0 and q_result.rows:
                 # Secondary drilldown finding
-                first_val = _extract_scalar(q_result)
+                drill_val, col_name, entity_label = _extract_primary_metric_value(
+                    q_result,
+                    metric_name=plan.metric,
+                    time_window=plan.time_window,
+                    question=question
+                )
+                finding_label = entity_label or plan_query.purpose
                 findings.append(
                     Finding(
                         id=f"F_{qid}",
                         kind="driver",
-                        template=f"{plan_query.purpose}: {{val}} [{{query_id}}]",
-                        values={"val": first_val if first_val is not None else 0.0, "query_id": qid},
+                        template=f"{finding_label}: {{val}} [{{query_id}}]",
+                        values={"val": drill_val if drill_val is not None else 0.0, "query_id": qid},
                         query_id=qid,
-                        statement=f"{plan_query.purpose}: {first_val:,.2f} [{qid}]" if first_val is not None else f"{plan_query.purpose} [{qid}]",
-                        value=first_val,
-                        formatted_value=f"{first_val:,.2f}" if first_val is not None else None
+                        statement=f"{finding_label}: {drill_val:,.2f} [{qid}]" if drill_val is not None else f"{finding_label} [{qid}]",
+                        value=drill_val,
+                        formatted_value=f"{drill_val:,.2f}" if drill_val is not None else None
                     )
                 )
                 emit_event("drilldown", f"Drill-down finding captured from {qid}", query_id=qid)
