@@ -35,6 +35,8 @@ class Plan:
     filters: Dict[str, Any] = field(default_factory=dict) # e.g., {"region": "South"}
     drill_down_dimensions: List[str] = field(default_factory=list) # e.g., ["region", "product", "time"]
     query_list: List[PlanQuery] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    question: str = ""
     needs_clarification: bool = False
     clarification_message: Optional[str] = None
     is_refusal: bool = False
@@ -45,20 +47,30 @@ class Plan:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Plan":
+        raw_queries = data.get("queries") if "queries" in data else data.get("query_list", [])
         queries = [
             PlanQuery.from_dict(q) if isinstance(q, dict) else q
-            for q in data.get("query_list", [])
+            for q in raw_queries
         ]
+        time_win = data.get("time_window", "")
+        if isinstance(time_win, dict):
+            time_win = time_win.get("value") or time_win.get("type", "")
+        comp_win = data.get("comparison_window") if "comparison_window" in data else data.get("comparison_period")
+        if isinstance(comp_win, dict):
+            comp_win = comp_win.get("value") or comp_win.get("type", "")
+
         return cls(
             metric=data.get("metric", ""),
-            time_window=data.get("time_window", ""),
-            comparison_period=data.get("comparison_period"),
+            time_window=str(time_win),
+            comparison_period=str(comp_win) if comp_win is not None else None,
             filters=data.get("filters", {}),
             drill_down_dimensions=data.get("drill_down_dimensions", []),
             query_list=queries,
-            needs_clarification=data.get("needs_clarification", False),
-            clarification_message=data.get("clarification_message"),
-            is_refusal=data.get("is_refusal", False),
+            assumptions=data.get("assumptions", []),
+            question=data.get("question", ""),
+            needs_clarification=data.get("needs_clarification", bool(data.get("clarification_question"))),
+            clarification_message=data.get("clarification_question") or data.get("clarification_message"),
+            is_refusal=data.get("refused", data.get("is_refusal", False)),
             refusal_reason=data.get("refusal_reason")
         )
 

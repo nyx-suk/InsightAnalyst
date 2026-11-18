@@ -1,0 +1,38 @@
+# knowledge/rules.yaml
+# Business rules list for InsightAnalyst query grounding and ChromaDB indexing.
+
+rules:
+  - id: "rule_time_anchoring"
+    title: "Time Anchoring and Relative Date Windows"
+    text: >
+      'Last month' means the last complete calendar month in the Northwind data,
+      which is September 2023 (2023-09-01 to 2023-09-30), not today's calendar date.
+      'Previous period' or 'prior month' strictly means the month immediately preceding
+      it (August 2023, 2023-08-01 to 2023-08-31). Always state this date anchoring
+      assumption in the analysis report.
+
+  - id: "rule_region_mapping"
+    title: "Region Mapping via dim_country_region"
+    text: >
+      Every customer order belongs to exactly one sales region via the dim_country_region table,
+      joined on customer country:
+      JOIN Customers c ON o.CustomerID = c.CustomerID
+      JOIN dim_country_region dcr ON c.Country = dcr.Country.
+      The three canonical sales regions are South (Argentina, Brazil, Venezuela),
+      North (Canada, Mexico, USA), and Europe (15 European countries).
+      NEVER join EmployeeTerritories or Regions, which duplicates rows and inflates sales figures.
+
+  - id: "rule_reconciliation"
+    title: "Reconciliation and Sum Consistency"
+    text: >
+      Breakdowns across dimensions (such as by region, product category, or month)
+      must sum up to the overall total metric within a small tolerance. If the sum
+      of broken-down components does not match the company total, reject the result
+      as suspicious (typically indicating an improper join fan-out or missing rows).
+
+  - id: "rule_revenue_formula"
+    title: "Revenue Definition and Freight Exclusion"
+    text: >
+      Revenue must strictly use the metric formula SUM(UnitPrice * Quantity * (1 - Discount))
+      from [Order Details]. Orders.Freight is a shipping fee and must NEVER be included
+      in revenue. Always bracket [Order Details] because the table name has a space.

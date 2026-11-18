@@ -1,11 +1,13 @@
 """knowledge/build_index.py
-Builds and persists the ChromaDB vector index from schema notes, metric definitions, and business rules.
+Builds and persists the ChromaDB vector index from schema_notes.md, metrics.yaml, and rules.yaml.
+Stores discrete chunks with metadata: type ('table' | 'metric' | 'rule') and stable IDs.
 """
 
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List
+
 try:
     import yaml
 except ImportError:
@@ -15,27 +17,57 @@ CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = "insight_knowledge"
 
 
+def load_schema_notes(filepath: Path) -> List[Dict[str, Any]]:
+    """Loads schema notes into one chunk per table section."""
+    if not filepath.exists():
+        return []
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Split by markdown ## headers
+    sections = re.split(r'\n(?=## )', content)
+    chunks = []
+    for sec in sections:
+        clean = sec.strip()
+        if not clean or clean.startswith("# Northwind"):
+            continue
+        first_line = clean.splitlines()[0].replace("#", "").strip().replace("[", "").replace("]", "")
+        table_name = first_line.split()[0]
+        chunks.append({
+            "id": f"table_{table_name.lower()}",
+            "text": clean,
+            "metadata": {
+                "type": "table",
+                "name": table_name,
+                "source": "schema_notes.md"
+            }
+        })
+    return chunks
+
+
 def load_metrics(filepath: Path) -> List[Dict[str, Any]]:
-    """Loads metric definitions from metrics.yaml into discrete knowledge chunks."""
+    """Loads metrics from metrics.yaml into one chunk per metric."""
     if not filepath.exists():
         return []
     if yaml is None:
-        print("[build_index] pyyaml not installed. Run 'pip install -r requirements.txt'")
+        print("[build_index] pyyaml not installed. Run 'pip install pyyaml'")
         return []
+
     with open(filepath, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     chunks = []
-    metrics = data.get("metrics", {})
-    for key, info in metrics.items():
+    for key, info in data.get("metrics", {}).items():
+        synonyms_str = ", ".join(info.get("synonyms", []))
         caveats_str = "; ".join(info.get("caveats", []))
         text = (
             f"Metric: {info.get('name', key)}\n"
-            f"Formula: {info.get('formula')}\n"
-            f"Table: {info.get('source_table')}\n"
-            f"Grain: {info.get('grain')}\n"
+            f"Description: {info.get('description', '')}\n"
+            f"Synonyms: {synonyms_str}\n"
+            f"Formula SQL: {info.get('formula_sql', '')}\n"
+            f"Grain: {info.get('grain', '')}\n"
             f"Caveats: {caveats_str}\n"
-            f"Example SQL:\n{info.get('example_sql', '').strip()}"
+            f"Example Question: {info.get('example_question', '')}"
         )
         chunks.append({
             "id": f"metric_{key}",
@@ -49,61 +81,58 @@ def load_metrics(filepath: Path) -> List[Dict[str, Any]]:
     return chunks
 
 
-def load_markdown_sections(filepath: Path, doc_type: str) -> List[Dict[str, Any]]:
-    """Splits markdown files into section-level knowledge chunks."""
+def load_rules(filepath: Path) -> List[Dict[str, Any]]:
+    """Loads business rules from rules.yaml into one chunk per rule."""
     if not filepath.exists():
         return []
+    if yaml is None:
+        return []
+
     with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
+        data = yaml.safe_load(f) or {}
 
-    # Split by markdown headers (## )
-    sections = re.split(r'\n(?=## )', content)
     chunks = []
-    base_name = filepath.stem
-
-    for idx, sec in enumerate(sections):
-        clean_text = sec.strip()
-        if not clean_text:
-            continue
-        first_line = clean_text.splitlines()[0].replace("#", "").strip()
+    for item in data.get("rules", []):
+        rule_id = item.get("id", "")
+        title = item.get("title", "")
+        text = item.get("text", "").strip()
+        doc_str = f"Rule: {title}\n{text}"
         chunks.append({
-            "id": f"{base_name}_{idx}",
-            "text": clean_text,
+            "id": rule_id,
+            "text": doc_str,
             "metadata": {
-                "type": doc_type,
-                "name": first_line,
-                "source": filepath.name
+                "type": "rule",
+                "name": title,
+                "source": "rules.yaml"
             }
         })
     return chunks
 
 
 def build_index() -> int:
-    """Builds the ChromaDB collection from local knowledge files."""
+    """Builds and persists the local ChromaDB index."""
     try:
         import chromadb
     except ImportError:
-        print("[build_index] chromadb is not installed. Please install requirements.txt.")
+        print("[build_index] Note: chromadb is not installed. To build index, run 'pip install chromadb'.")
         return 0
 
     base_dir = Path(__file__).resolve().parent
     all_chunks: List[Dict[str, Any]] = []
 
-    # 1. Load metrics
-    metrics_path = base_dir / "metrics.yaml"
-    all_chunks.extend(load_metrics(metrics_path))
-
-    # 2. Load schema notes
-    schema_path = base_dir / "schema_notes.md"
-    all_chunks.extend(load_markdown_sections(schema_path, "schema"))
-
-    # 3. Load business rules
-    rules_path = base_dir / "business_rules.md"
-    all_chunks.extend(load_markdown_sections(rules_path, "rule"))
+    # 1. Schema notes (one chunk per table)
+    all_chunks.extend(load_schema_notes(base_dir / "schema_notes.md"))
+    # 2. Metrics (one chunk per metric)
+    all_chunks.extend(load_metrics(base_dir / "metrics.yaml"))
+    # 3. Rules (one chunk per rule)
+    all_chunks.extend(load_rules(base_dir / "rules.yaml"))
 
     if not all_chunks:
         print("[build_index] No knowledge chunks found.")
         return 0
+
+    print("[build_index] Notice: ChromaDB's default embedding model downloads on first use.")
+    print("[build_index] Run this once while connected to internet, then the index can be reused offline.")
 
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     try:
@@ -113,20 +142,16 @@ def build_index() -> int:
 
     collection = client.create_collection(
         name=COLLECTION_NAME,
-        metadata={"description": "Knowledge base for InsightAnalyst text-to-SQL"}
+        metadata={"description": "Knowledge chunks for InsightAnalyst"}
     )
-
-    ids = [c["id"] for c in all_chunks]
-    documents = [c["text"] for c in all_chunks]
-    metadatas = [c["metadata"] for c in all_chunks]
 
     collection.add(
-        ids=ids,
-        documents=documents,
-        metadatas=metadatas
+        ids=[c["id"] for c in all_chunks],
+        documents=[c["text"] for c in all_chunks],
+        metadatas=[c["metadata"] for c in all_chunks]
     )
 
-    print(f"[build_index] Successfully indexed {len(all_chunks)} chunks into '{COLLECTION_NAME}' at {CHROATH if 'CHROATH' in locals() else CHROMA_PATH}.")
+    print(f"[build_index] Successfully indexed {len(all_chunks)} chunks into collection '{COLLECTION_NAME}' at '{CHROMA_PATH}'.")
     return len(all_chunks)
 
 
