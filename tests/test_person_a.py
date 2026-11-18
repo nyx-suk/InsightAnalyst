@@ -11,7 +11,7 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from contracts import Plan, PlanQuery, QueryResult, ValidationResult, Finding, AgentResponse
+from contracts import Plan, PlanQuery, QueryResult, ValidationResult, Finding, AgentResponse, TraceEvent, AgentRun
 from knowledge.retriever import retrieve
 from agent.llm import parse_json_safely, clean_json_string, _get_cache_key
 from agent.planner import _check_quick_refusal, create_plan
@@ -59,6 +59,79 @@ class TestContracts(unittest.TestCase):
         restored = ValidationResult.from_dict(data)
         self.assertEqual(restored.status, "pass")
         self.assertEqual(restored.check_name, "empty_check")
+
+    def test_finding_and_template_rendering(self):
+        """Prompt 3.1: Numbers appear only in Finding.values and are filled into template by code."""
+        finding = Finding(
+            id="F1",
+            kind="driver",
+            template="South revenue fell {pct_change}% [{query_id}]",
+            values={"pct_change": -18.2},
+            query_id="Q1"
+        )
+        self.assertEqual(finding.id, "F1")
+        self.assertEqual(finding.kind, "driver")
+        self.assertEqual(finding.values["pct_change"], -18.2)
+        # Verify code renders the template
+        rendered = finding.render()
+        self.assertEqual(rendered, "South revenue fell -18.2% [Q1]")
+        self.assertEqual(finding.statement, "South revenue fell -18.2% [Q1]")
+
+        # Test serialization round-trip
+        data = finding.to_dict()
+        restored = Finding.from_dict(data)
+        self.assertEqual(restored.id, "F1")
+        self.assertEqual(restored.kind, "driver")
+        self.assertEqual(restored.values, {"pct_change": -18.2})
+        self.assertEqual(restored.query_id, "Q1")
+        self.assertEqual(restored.render(), "South revenue fell -18.2% [Q1]")
+
+    def test_trace_event_serialization(self):
+        """Prompt 3.1: TraceEvent step, event, message, query_id."""
+        event = TraceEvent(
+            step=1,
+            event="query",
+            message="Executing baseline revenue query",
+            query_id="Q1"
+        )
+        data = event.to_dict()
+        restored = TraceEvent.from_dict(data)
+        self.assertEqual(restored.step, 1)
+        self.assertEqual(restored.event, "query")
+        self.assertEqual(restored.message, "Executing baseline revenue query")
+        self.assertEqual(restored.query_id, "Q1")
+
+    def test_agent_run_serialization(self):
+        """Prompt 3.1: AgentRun complete execution record."""
+        pq = PlanQuery(query_id="Q1", sql="SELECT 1;", purpose="Test")
+        plan = Plan(metric="revenue", time_window="2023-09", query_list=[pq])
+        qr = QueryResult(query_id="Q1", sql="SELECT 1;", columns=["col"], rows=[(1,)], row_count=1)
+        vr = ValidationResult(status="pass", check_name="execution")
+        finding = Finding(id="F1", kind="headline", template="Revenue is {total} [{query_id}]", values={"total": 634607.27}, query_id="Q1")
+        trace = TraceEvent(step=1, event="plan", message="Plan created")
+
+        run = AgentRun(
+            question="What was revenue in September 2023?",
+            plan=plan,
+            queries=[qr],
+            validations=[vr],
+            findings=[finding],
+            trace=[trace],
+            assumptions=["September 2023 is last complete month"],
+            status="complete"
+        )
+
+        data = run.to_dict()
+        restored = AgentRun.from_dict(data)
+        self.assertEqual(restored.question, "What was revenue in September 2023?")
+        self.assertEqual(restored.status, "complete")
+        self.assertEqual(len(restored.queries), 1)
+        self.assertEqual(len(restored.validations), 1)
+        self.assertEqual(len(restored.findings), 1)
+        self.assertEqual(restored.findings[0].render(), "Revenue is 634607.27 [Q1]")
+        self.assertEqual(len(restored.trace), 1)
+        self.assertEqual(restored.trace[0].event, "plan")
+        self.assertEqual(restored.assumptions, ["September 2023 is last complete month"])
 
 
 class TestKnowledgeLayer(unittest.TestCase):
