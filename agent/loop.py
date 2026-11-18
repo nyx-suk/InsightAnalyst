@@ -1,13 +1,15 @@
 """agent/loop.py
 Autonomous analytics execution loop for InsightAnalyst.
-Orchestrates: Retrieve -> Plan -> Resolve Window -> Execute -> Validate -> Contribution / Drill-Down -> Traceable Findings.
+Orchestrates: Retrieve -> Plan -> Resolve Window -> Execute -> Validate -> Correct/Repair -> Contribution / Drill-Down -> Traceable Findings.
 
 Enforces query budget (max 8 queries) and retry caps (max 3 retries per query).
+Implements LLM query repair (prompts/repair.txt) on execution and validation failures.
 Emits structured TraceEvent objects for every step.
 """
 
 import json
 import logging
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import sys
 from pathlib import Path
@@ -33,11 +35,15 @@ from agent.contribution import (
     build_driver_finding,
     ContributionAnalysis
 )
+import agent.llm as default_llm
+from agent.llm import parse_json_safely
 
 logger = logging.getLogger("InsightAnalyst.Loop")
 
 MAX_TOTAL_QUERIES = 8
 MAX_RETRIES_PER_QUERY = 3
+
+REPAIR_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "repair.txt"
 
 
 def _call_executor(executor: Any, query_id: str, sql: str) -> QueryResult:
@@ -84,6 +90,90 @@ def _extract_scalar(result: QueryResult) -> Optional[float]:
                 except ValueError:
                     continue
     return None
+
+
+def repair_query(
+    question: str,
+    failed_sql: str,
+    error_message: str,
+    check_name: str = "execution",
+    schema_chunks: Optional[List[str]] = None,
+    llm: Any = None,
+    error_type: str = "Execution Error"
+) -> Optional[str]:
+    """
+    Prompt 3.4: Calls LLM to repair a SQL query that failed execution or validation.
+    Reads prompt template from prompts/repair.txt.
+    """
+    if REPAIR_PROMPT_PATH.exists():
+        template = REPAIR_PROMPT_PATH.read_text(encoding="utf-8")
+    else:
+        template = (
+            "You are a SQLite query debugger for InsightAnalyst.\n"
+            "Question: {question}\nFailed SQL: {failed_sql}\nError: {error_message}\n"
+            "Return JSON with corrected 'sql'."
+        )
+
+    schema_str = ""
+    if schema_chunks:
+        formatted = []
+        for c in schema_chunks:
+            if isinstance(c, dict):
+                formatted.append(c.get("document", str(c)))
+            else:
+                formatted.append(str(c))
+        schema_str = "\n\n".join(formatted[:6])
+    else:
+        schema_str = (
+            "Table [Order Details]: OrderID, ProductID, UnitPrice, Quantity, Discount\n"
+            "Table Customers: CustomerID, Country\n"
+            "Table Orders: OrderID, CustomerID, OrderDate\n"
+            "Table Products: ProductID, ProductName, UnitPrice, CategoryID\n"
+            "Table Categories: CategoryID, CategoryName\n"
+            "Table dim_country_region: Country, Region ('South', 'North', 'Europe')"
+        )
+
+    prompt = (
+        template
+        .replace("{schema_context}", schema_str)
+        .replace("{question}", question)
+        .replace("{failed_sql}", failed_sql)
+        .replace("{error_type}", error_type)
+        .replace("{check_name}", check_name)
+        .replace("{error_message}", error_message)
+    )
+
+    active_llm = llm or default_llm
+    parsed = None
+
+    try:
+        if hasattr(active_llm, "generate_json"):
+            parsed = active_llm.generate_json(prompt)
+        elif hasattr(active_llm, "generate"):
+            raw = active_llm.generate(prompt, temperature=0.0)
+            parsed = parse_json_safely(raw)
+        elif callable(active_llm):
+            raw = active_llm(prompt)
+            parsed = parse_json_safely(raw)
+    except Exception as e:
+        logger.warning(f"Error calling LLM for query repair: {e}")
+        return None
+
+    if isinstance(parsed, dict) and "sql" in parsed:
+        repaired_sql = str(parsed["sql"]).strip()
+        # Ensure it's a read-only query
+        upper_sql = repaired_sql.upper()
+        forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA"]
+        if any(f"{kw} " in upper_sql or f" {kw}" in upper_sql for kw in forbidden):
+            logger.warning(f"Repaired SQL contained forbidden write keyword: {repaired_sql}")
+            return None
+        return repaired_sql
+
+    return None
+
+
+# Backward-compatible alias
+_rewrite_query = repair_query
 
 
 def _generate_drilldown_query(
@@ -154,7 +244,7 @@ def run_agent(
     on_event: Optional[Callable[[TraceEvent], None]] = None
 ) -> AgentRun:
     """
-    Main autonomous agent execution loop adhering to Prompt 3.3.
+    Main autonomous agent execution loop adhering to Prompt 3.3 and 3.4.
     
     Args:
         question: User natural language analytics question.
@@ -289,50 +379,103 @@ def run_agent(
         plan_query = queries_to_run.pop(0)
         qid = plan_query.query_id or f"Q{q_idx+1}"
         current_sql = plan_query.sql
-        retry_count = 0
+        attempt = 0
         q_result: Optional[QueryResult] = None
+        query_succeeded = False
+        last_val_results: List[ValidationResult] = []
 
-        while retry_count < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
-            emit_event("query", f"Executing {qid} (attempt {retry_count+1}): {plan_query.purpose}", query_id=qid)
+        # Retry and Query Repair loop (max 3 retries per query)
+        while attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
+            attempt += 1
             total_query_count += 1
+            emit_event("query", f"Executing {qid} (attempt {attempt}): {plan_query.purpose}", query_id=qid)
 
             if executor:
                 q_result = _call_executor(executor, qid, current_sql)
             else:
                 q_result = QueryResult(query_id=qid, sql=current_sql, error="No executor provided")
 
+            # 1. Execution Check
             if q_result.error:
-                emit_event("retry", f"{qid} execution failed: {q_result.error}", query_id=qid)
-                retry_count += 1
-                continue
-            else:
+                emit_event("retry", f"{qid} execution error on attempt {attempt}: {q_result.error}", query_id=qid)
+                if attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
+                    emit_event("retry", f"Calling LLM query repair for {qid} execution error...", query_id=qid)
+                    repaired_sql = repair_query(
+                        question=question,
+                        failed_sql=current_sql,
+                        error_message=q_result.error,
+                        check_name="execution",
+                        schema_chunks=docs,
+                        llm=llm,
+                        error_type="Execution Error"
+                    )
+                    if repaired_sql:
+                        current_sql = repaired_sql
+                    continue
+                # Reached cap
                 break
 
-        if not q_result:
+            # 2. Validation Check
+            val_context: Dict[str, Any] = {}
+            if plan.time_window and "Orders" in current_sql:
+                try:
+                    s, e = resolve_window(plan.time_window)
+                    val_context["date_window"] = {"start": s, "end": e}
+                    val_context["date_column"] = "OrderDate"
+                except Exception:
+                    pass
+
+            if "dim_country_region" in current_sql:
+                val_context["required_sql_fragments"] = ["dim_country_region"]
+
+            val_results: List[ValidationResult] = []
+            if validator:
+                val_results = _call_validator(validator, q_result, context=val_context)
+                last_val_results = val_results
+                check_statuses = [v.status for v in val_results]
+                emit_event("check", f"Validated {qid}: {check_statuses}", query_id=qid)
+
+            # Check for validation failures
+            val_failures = [v for v in val_results if v.status in ("fail", "suspicious")]
+            if not val_failures:
+                # Succeeded execution and passed validation cleanly!
+                query_succeeded = True
+                break
+
+            # Has validation failure -> trigger query repair
+            fail_reasons = "; ".join([f"{f.check_name}: {f.reason}" for f in val_failures])
+            emit_event("retry", f"{qid} validation failed on attempt {attempt}: {fail_reasons}", query_id=qid)
+
+            if attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
+                first_fail = val_failures[0]
+                emit_event("retry", f"Calling LLM query repair for {qid} validation failure ({first_fail.check_name})...", query_id=qid)
+                repaired_sql = repair_query(
+                    question=question,
+                    failed_sql=current_sql,
+                    error_message=first_fail.reason or "Validation check failed",
+                    check_name=first_fail.check_name,
+                    schema_chunks=docs,
+                    llm=llm,
+                    error_type="Validation Failure"
+                )
+                if repaired_sql:
+                    current_sql = repaired_sql
+                continue
+
+            # Reached cap
+            break
+
+        if q_result:
+            executed_queries.append(q_result)
+        if last_val_results:
+            all_validations.extend(last_val_results)
+
+        # After 3 failed attempts, mark query failed, keep going if other queries support partial answer,
+        # and NEVER present failed query numbers as findings.
+        if not query_succeeded:
+            emit_event("error", f"{qid} failed after {attempt} attempts and is marked failed. Numbers will not be presented.", query_id=qid)
             q_idx += 1
             continue
-
-        executed_queries.append(q_result)
-
-        # Validate result
-        val_context: Dict[str, Any] = {}
-        if plan.time_window and "Orders" in current_sql:
-            try:
-                s, e = resolve_window(plan.time_window)
-                val_context["date_window"] = {"start": s, "end": e}
-                val_context["date_column"] = "OrderDate"
-            except Exception:
-                pass
-
-        if "dim_country_region" in current_sql:
-            val_context["required_sql_fragments"] = ["dim_country_region"]
-
-        val_results: List[ValidationResult] = []
-        if validator:
-            val_results = _call_validator(validator, q_result, context=val_context)
-            all_validations.extend(val_results)
-            check_statuses = [v.status for v in val_results]
-            emit_event("check", f"Validated {qid}: {check_statuses}", query_id=qid)
 
         # Step 3: Analyze baseline result (Q1)
         if q_idx == 0:
@@ -412,8 +555,11 @@ def run_agent(
     # Determine final status
     status = "complete"
     failed_queries = [q for q in executed_queries if q.error]
-    if failed_queries:
-        status = "partial" if len(failed_queries) < len(executed_queries) else "failed"
+    # Also treat un-succeeded validation queries as failed
+    if len(findings) == 0:
+        status = "failed"
+    elif failed_queries or len(executed_queries) < len(plan.query_list):
+        status = "partial"
 
     emit_event("done", f"Agent run completed with status '{status}' and {len(findings)} traceable findings")
 

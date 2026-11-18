@@ -249,8 +249,10 @@ class TestAgentLoop(unittest.TestCase):
   "is_refusal": false,
   "refusal_reason": null
 }"""
-        from agent.llm import register_fake_response, clear_fake_responses
+        from agent.llm import register_fake_response, clear_fake_responses, _write_to_cache, _get_cache_key
         os.environ["LLM_PROVIDER"] = "fake"
+        old_cache = os.environ.get("CACHE_MODE", "readwrite")
+        os.environ["CACHE_MODE"] = "off"
         register_fake_response(sample_q, dummy_plan_json)
 
         response = run_agent_loop(
@@ -260,6 +262,7 @@ class TestAgentLoop(unittest.TestCase):
             trace_callback=trace_collector
         )
         clear_fake_responses()
+        os.environ["CACHE_MODE"] = old_cache
 
         self.assertEqual(response.status, "success")
         self.assertGreater(len(response.findings), 0)

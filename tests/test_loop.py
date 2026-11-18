@@ -31,10 +31,18 @@ class FakeRetriever:
 
 class FakeLLM:
     """Mock LLM returning controlled responses."""
-    def __init__(self, plan_to_return: Plan):
+    def __init__(self, plan_to_return: Plan, repair_sql: str = None):
         self.plan = plan_to_return
+        self.repair_sql = repair_sql
+        self.repair_calls = []
 
     def generate_json(self, prompt: str, system: str = None):
+        if "query debugger" in prompt.lower() or "failure type" in prompt.lower():
+            self.repair_calls.append(prompt)
+            return {
+                "sql": self.repair_sql or "SELECT 1;",
+                "explanation": "Corrected query"
+            }
         return self.plan.to_dict()
 
 
@@ -251,6 +259,152 @@ class TestAgentLoopPrompt33(unittest.TestCase):
         # Total executed queries must not exceed MAX_TOTAL_QUERIES (8)
         self.assertEqual(len(run.queries), MAX_TOTAL_QUERIES)
         self.assertEqual(len(executor.calls), MAX_TOTAL_QUERIES)
+
+    def test_repair_on_wrong_column_name(self):
+        """Prompt 3.4: Inject wrong column name; verify LLM repair is called and loop recovers."""
+        bad_sql = "SELECT WrongCol FROM Orders;"
+        good_sql = "SELECT OrderID FROM Orders;"
+        plan = Plan(
+            metric="orders",
+            time_window="2023-09",
+            query_list=[PlanQuery(query_id="Q1", sql=bad_sql, purpose="Get order count")]
+        )
+
+        class ConditionalExecutor:
+            def __init__(self):
+                self.calls = []
+            def execute_query(self, query_id: str, sql: str) -> QueryResult:
+                self.calls.append((query_id, sql))
+                if "WrongCol" in sql:
+                    return QueryResult(query_id=query_id, sql=sql, error="no such column: WrongCol")
+                return QueryResult(query_id=query_id, sql=sql, columns=["OrderID"], rows=[(10248,)], row_count=1)
+
+        executor = ConditionalExecutor()
+        llm = FakeLLM(plan, repair_sql=good_sql)
+
+        run = run_agent(
+            question="How many orders?",
+            retriever=FakeRetriever(),
+            llm=llm,
+            executor=executor,
+            validator=FakeValidator(status="pass")
+        )
+
+        # Loop must recover and finish with complete status
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(len(llm.repair_calls), 1)
+        self.assertIn("no such column: WrongCol", llm.repair_calls[0])
+        # Executed twice: attempt 1 with bad_sql, attempt 2 with good_sql
+        self.assertEqual(len(executor.calls), 2)
+        self.assertEqual(executor.calls[0][1], bad_sql)
+        self.assertEqual(executor.calls[1][1], good_sql)
+        # Findings should be generated from good_sql
+        self.assertGreater(len(run.findings), 0)
+        self.assertEqual(run.findings[0].query_id, "Q1")
+
+    def test_repair_on_reconciliation_failure(self):
+        """Prompt 3.4: Inject reconciliation validation failure; verify LLM repair recovers."""
+        initial_sql = "SELECT Region, aug, sep FROM broken_summary;"
+        fixed_sql = "SELECT Region, aug, sep FROM reconciled_summary;"
+        plan = Plan(
+            metric="revenue",
+            time_window="2023-09",
+            comparison_period="2023-08",
+            query_list=[PlanQuery(query_id="Q1", sql=initial_sql, purpose="Regional comparison")]
+        )
+
+        class ReconciliationValidator:
+            def __init__(self):
+                self.attempt = 0
+            def validate(self, result: QueryResult, context=None):
+                self.attempt += 1
+                if "broken" in result.sql:
+                    return [
+                        ValidationResult(
+                            status="fail",
+                            reason="Reconciliation failed: breakdown total 100 != expected 150",
+                            check_name="reconciliation"
+                        )
+                    ]
+                return [ValidationResult(status="pass", check_name="reconciliation")]
+
+        class ReconcileExecutor:
+            def __init__(self):
+                self.calls = []
+            def execute_query(self, query_id: str, sql: str) -> QueryResult:
+                self.calls.append(sql)
+                return QueryResult(
+                    query_id=query_id,
+                    sql=sql,
+                    columns=["Region", "aug", "sep"],
+                    rows=[("South", 100.0, 50.0), ("Europe", 50.0, 40.0)],
+                    row_count=2
+                )
+
+        validator = ReconciliationValidator()
+        executor = ReconcileExecutor()
+        llm = FakeLLM(plan, repair_sql=fixed_sql)
+
+        run = run_agent(
+            question="Why did revenue drop?",
+            retriever=FakeRetriever(),
+            llm=llm,
+            executor=executor,
+            validator=validator
+        )
+
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(len(llm.repair_calls), 1)
+        self.assertIn("Reconciliation failed", llm.repair_calls[0])
+        self.assertEqual(len(executor.calls), 2)
+        self.assertEqual(executor.calls[1], fixed_sql)
+        self.assertGreater(len(run.findings), 0)
+
+    def test_failed_query_after_three_attempts_partial_answer(self):
+        """Prompt 3.4: Q1 fails all 3 attempts; Q2 succeeds. Status is partial, Q1 has no findings."""
+        plan = Plan(
+            metric="revenue",
+            time_window="2023-09",
+            query_list=[
+                PlanQuery(query_id="Q1", sql="SELECT BadCol FROM Orders;", purpose="Failing query"),
+                PlanQuery(query_id="Q2", sql="SELECT 100 AS GoodVal;", purpose="Succeeding query")
+            ]
+        )
+
+        class PartialExecutor:
+            def __init__(self):
+                self.calls = []
+            def execute_query(self, query_id: str, sql: str) -> QueryResult:
+                self.calls.append((query_id, sql))
+                if query_id == "Q1":
+                    return QueryResult(query_id=query_id, sql=sql, error="Permanent syntax error")
+                return QueryResult(query_id=query_id, sql=sql, columns=["GoodVal"], rows=[(100,)], row_count=1)
+
+        executor = PartialExecutor()
+        # LLM repair returns unrepairable SQL so Q1 fails 3 attempts
+        llm = FakeLLM(plan, repair_sql="SELECT BadCol FROM Orders;")
+
+        run = run_agent(
+            question="Multi-query test",
+            retriever=FakeRetriever(),
+            llm=llm,
+            executor=executor,
+            validator=FakeValidator()
+        )
+
+        # Status must be partial because Q1 failed but Q2 succeeded
+        self.assertEqual(run.status, "partial")
+        # Q1 was attempted 3 times
+        q1_calls = [c for c in executor.calls if c[0] == "Q1"]
+        self.assertEqual(len(q1_calls), 3)
+        # Q2 was executed
+        q2_calls = [c for c in executor.calls if c[0] == "Q2"]
+        self.assertEqual(len(q2_calls), 1)
+
+        # CRITICAL: Numbers from failed Q1 must NEVER appear in findings
+        for finding in run.findings:
+            self.assertNotEqual(finding.query_id, "Q1")
+        self.assertTrue(all(f.query_id == "Q2" for f in run.findings))
 
 
 if __name__ == "__main__":
