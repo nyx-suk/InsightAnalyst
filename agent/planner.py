@@ -72,11 +72,15 @@ def validate_plan_dict(data: Dict[str, Any]) -> None:
     if is_refusal:
         if not (data.get("refusal_reason") or data.get("message")):
             raise ValueError("Plan marked as refused but missing 'refusal_reason'.")
+        # Refused plans must produce NO queries
+        queries = data.get("queries") if "queries" in data else data.get("query_list", [])
+        if queries:
+            raise ValueError("Plan marked as refused must not produce any SQL queries.")
         return
 
     if needs_clarification:
-        if not (data.get("clarification_question") or data.get("clarification_message")):
-            raise ValueError("Plan marked as needs_clarification but missing 'clarification_question'.")
+        if not (data.get("clarification_question") or data.get("clarification_message") or data.get("assumptions")):
+            raise ValueError("Plan marked as needs_clarification must provide a 'clarification_question' or explicit default 'assumptions'.")
         return
 
     # Normal execution plan requirements
