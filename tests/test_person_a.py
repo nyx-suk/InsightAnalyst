@@ -3,6 +3,7 @@ Comprehensive unit and integration test suite for Person A deliverables.
 Verifies contracts, retrieval, LLM caching & JSON parsing, planner safeguards, and the agent loop.
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -175,19 +176,9 @@ class TestAgentLoop(unittest.TestCase):
   "is_refusal": false,
   "refusal_reason": null
 }"""
-        # Retrieve context to match planner's prompt format for cache key
-        docs = retrieve(sample_q, k=4)
-        from agent.planner import PLANNER_SYSTEM_PROMPT, FEW_SHOT_EXAMPLES
-        context_blocks = []
-        for idx, c in enumerate(docs, 1):
-            meta = c.get("metadata", {})
-            header = f"[{meta.get('type', 'info').upper()} - {meta.get('name', 'General')}]"
-            context_blocks.append(f"--- Context Block {idx} {header} ---\n{c.get('document', '')}")
-        context_str = "\n\n".join(context_blocks)
-        user_prompt = f"RETRIEVED KNOWLEDGE BASE:\n{context_str}\n\nFEW-SHOT EXAMPLES:\n{FEW_SHOT_EXAMPLES}\n\nUSER QUESTION:\n\"{sample_q}\"\n\nGenerate the structured JSON plan now. Respond ONLY with valid JSON."
-        
-        cache_key = _get_cache_key(user_prompt, PLANNER_SYSTEM_PROMPT, "gemini-2.0-flash", "gemini")
-        _write_to_cache(cache_key, dummy_plan_json, {"provider": "cache_test"})
+        from agent.llm import register_fake_response, clear_fake_responses
+        os.environ["LLM_PROVIDER"] = "fake"
+        register_fake_response(sample_q, dummy_plan_json)
 
         response = run_agent_loop(
             question=sample_q,
@@ -195,6 +186,7 @@ class TestAgentLoop(unittest.TestCase):
             validator_fn=mock_validator,
             trace_callback=trace_collector
         )
+        clear_fake_responses()
 
         self.assertEqual(response.status, "success")
         self.assertGreater(len(response.findings), 0)
