@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts import Plan, PlanQuery, QueryResult, ValidationResult, TraceEvent, AgentRun
 from agent.loop import run_agent, MAX_TOTAL_QUERIES, MAX_RETRIES_PER_QUERY
+from agent.llm import LLMError, LLMRateLimitError
 
 
 class FakeRetriever:
@@ -405,6 +406,216 @@ class TestAgentLoopPrompt33(unittest.TestCase):
         for finding in run.findings:
             self.assertNotEqual(finding.query_id, "Q1")
         self.assertTrue(all(f.query_id == "Q2" for f in run.findings))
+
+    def test_llm_rate_limit_error_handled_gracefully(self):
+        """Prompt 3.6: LLMRateLimitError during planning returns failed status without unhandled exception."""
+        class RateLimitedLLM:
+            def generate_json(self, prompt, system=None):
+                raise LLMRateLimitError("ResourceExhausted: 429 Rate limit quota exceeded")
+
+        run = run_agent(
+            question="What is revenue?",
+            retriever=FakeRetriever(),
+            llm=RateLimitedLLM(),
+            executor=FakeExecutor(),
+            validator=FakeValidator()
+        )
+
+        self.assertEqual(run.status, "failed")
+        self.assertIn("rate limit", run.error.lower())
+        self.assertEqual(len(run.queries), 0)
+
+    def test_llm_readonly_cache_miss_handled_gracefully(self):
+        """Prompt 3.6: Cache miss in readonly mode returns clear error without unhandled exception."""
+        class CacheMissLLM:
+            def generate_json(self, prompt, system=None):
+                raise LLMError("Cache miss in readonly mode for provider=gemini, key=abc1234")
+
+        run = run_agent(
+            question="What is revenue?",
+            retriever=FakeRetriever(),
+            llm=CacheMissLLM(),
+            executor=FakeExecutor(),
+            validator=FakeValidator()
+        )
+
+        self.assertEqual(run.status, "failed")
+        self.assertIn("readonly", run.error.lower())
+        self.assertIn("cache miss", run.error.lower())
+
+    def test_llm_error_during_query_repair_preserves_completed_queries(self):
+        """Prompt 3.6: LLM failure during query repair preserves Q1 findings and returns partial status."""
+        plan = Plan(
+            metric="revenue",
+            time_window="2023-09",
+            query_list=[
+                PlanQuery(query_id="Q1", sql="SELECT 100 AS val;", purpose="Q1 baseline"),
+                PlanQuery(query_id="Q2", sql="SELECT BadCol FROM Orders;", purpose="Q2 breakdown")
+            ]
+        )
+
+        class ErrorOnRepairLLM:
+            def __init__(self, plan):
+                self.plan = plan
+            def generate_json(self, prompt, system=None):
+                if "failure type" in prompt.lower() or "repair" in prompt.lower():
+                    raise LLMError("Network timeout during repair call")
+                return self.plan.to_dict()
+
+        class CustomExecutor:
+            def execute_query(self, query_id: str, sql: str) -> QueryResult:
+                if query_id == "Q1":
+                    return QueryResult(query_id="Q1", sql=sql, columns=["val"], rows=[(100,)], row_count=1)
+                return QueryResult(query_id="Q2", sql=sql, error="no such column: BadCol")
+
+        run = run_agent(
+            question="Why did sales drop?",
+            retriever=FakeRetriever(),
+            llm=ErrorOnRepairLLM(plan),
+            executor=CustomExecutor(),
+            validator=FakeValidator()
+        )
+
+        # Q1 succeeded, Q2 failed and repair threw LLMError -> status must be partial
+        self.assertEqual(run.status, "partial")
+        self.assertEqual(len(run.queries), 2)
+        # Q1 finding preserved
+        self.assertEqual(len(run.findings), 1)
+        self.assertEqual(run.findings[0].query_id, "Q1")
+
+    def test_acceptance_headline_question_injected_errors(self):
+        """
+        Prompt 3.6 Acceptance Test:
+        Headline question: 'Why did sales drop in the South region last month?'
+        Inject a bad column (Attempt 1) and a join that duplicates rows (Attempt 2),
+        confirm both are caught and fixed, and record real outcomes.
+        """
+        # 1. Attempt 1 SQL: Bad column
+        bad_col_q1_sql = (
+            "SELECT dcr.Region, strftime('%Y-%m', o.OrderDate) AS OrderMonth, "
+            "SUM(od.NonExistentColumn) AS Revenue "
+            "FROM [Order Details] od "
+            "JOIN Orders o ON od.OrderID = o.OrderID "
+            "JOIN Customers c ON o.CustomerID = c.CustomerID "
+            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
+            "WHERE dcr.Region = 'South' "
+            "GROUP BY dcr.Region, OrderMonth;"
+        )
+
+        # 2. Attempt 2 SQL: Repaired column, but bad cross join that duplicates rows
+        dup_join_q1_sql = (
+            "SELECT dcr.Region, strftime('%Y-%m', o.OrderDate) AS OrderMonth, "
+            "ROUND(SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)), 2) AS Revenue "
+            "FROM [Order Details] od "
+            "JOIN Orders o ON od.OrderID = o.OrderID "
+            "JOIN Customers c ON o.CustomerID = c.CustomerID "
+            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
+            "JOIN Shippers s ON 1=1 "  # Cartesians/duplicates rows 3x
+            "WHERE dcr.Region = 'South' "
+            "GROUP BY dcr.Region, OrderMonth;"
+        )
+
+        # 3. Attempt 3 SQL: Fixed clean SQL without bad column and without duplicate join
+        clean_q1_sql = (
+            "SELECT dcr.Region, strftime('%Y-%m', o.OrderDate) AS OrderMonth, "
+            "ROUND(SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)), 2) AS Revenue "
+            "FROM [Order Details] od "
+            "JOIN Orders o ON od.OrderID = o.OrderID "
+            "JOIN Customers c ON o.CustomerID = c.CustomerID "
+            "JOIN dim_country_region dcr ON c.Country = dcr.Country "
+            "WHERE dcr.Region = 'South' "
+            "GROUP BY dcr.Region, OrderMonth;"
+        )
+
+        plan = Plan(
+            metric="revenue",
+            time_window="2023-09",
+            comparison_period="2023-08",
+            filters={"region": "South"},
+            drill_down_dimensions=["product"],
+            query_list=[
+                PlanQuery(query_id="Q1", sql=bad_col_q1_sql, purpose="South region monthly revenue")
+            ]
+        )
+
+        from executor import execute_query
+        from validator import validate
+
+        class MultiRepairAcceptanceLLM:
+            def __init__(self, plan):
+                self.plan = plan
+                self.repair_count = 0
+                self.repair_prompts = []
+
+            def generate_json(self, prompt, system=None):
+                if "failure type" in prompt.lower() or "repair" in prompt.lower():
+                    self.repair_count += 1
+                    self.repair_prompts.append(prompt)
+                    if self.repair_count == 1:
+                        # First repair: fixes column name but inadvertently introduces duplicate join
+                        return {
+                            "sql": dup_join_q1_sql,
+                            "explanation": "Fixed column to UnitPrice * Quantity * (1 - Discount), but joined Shippers"
+                        }
+                    else:
+                        # Second repair: removes duplicate join, leaving clean correct SQL
+                        return {
+                            "sql": clean_q1_sql,
+                            "explanation": "Removed duplicate join on Shippers table"
+                        }
+                return self.plan.to_dict()
+
+            def generate(self, prompt, system=None, temperature=0.0):
+                return (
+                    "South revenue fell by {F_headline.total_abs_change} "
+                    "in {driver_1.dimension_value} [{F_headline.query_id}]."
+                )
+
+        llm = MultiRepairAcceptanceLLM(plan)
+
+        def validating_with_join_check(res, context=None):
+            val_results = validate(res, context=context)
+            if "shippers" in res.sql.lower():
+                val_results.append(
+                    ValidationResult(
+                        status="fail",
+                        reason="Join with Shippers produces duplicate rows",
+                        check_name="duplicate_join"
+                    )
+                )
+            return val_results
+
+        run = run_agent(
+            question="Why did sales drop in the South region last month?",
+            retriever=FakeRetriever(),
+            llm=llm,
+            executor=execute_query,
+            validator=validating_with_join_check
+        )
+
+        # Acceptance check:
+        # 1. Both errors (bad column AND duplicate join) were caught and repaired
+        self.assertEqual(llm.repair_count, 2)
+        self.assertTrue(any("column" in p.lower() or "execution" in p.lower() for p in llm.repair_prompts))
+        self.assertTrue(any("duplicate" in p.lower() or "validation" in p.lower() for p in llm.repair_prompts))
+
+        # 2. Run completed successfully with real Northwind database execution
+        self.assertEqual(run.status, "complete")
+        self.assertGreater(len(run.queries), 0)
+        self.assertGreater(len(run.findings), 0)
+
+        # 3. Every single number links to a query ID
+        for finding in run.findings:
+            self.assertTrue(finding.query_id.startswith("Q"))
+            self.assertIn(finding.query_id, [q.query_id for q in run.queries])
+
+        # 4. Check TraceEvents show 2 retries, check, and done
+        retry_events = [e for e in run.trace if e.event == "retry"]
+        self.assertGreaterEqual(len(retry_events), 2)
+        event_types = [e.event for e in run.trace]
+        self.assertIn("retry", event_types)
+        self.assertIn("check", event_types)
+        self.assertIn("done", event_types)
 
 
 if __name__ == "__main__":

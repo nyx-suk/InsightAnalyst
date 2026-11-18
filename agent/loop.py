@@ -36,7 +36,8 @@ from agent.contribution import (
     ContributionAnalysis
 )
 import agent.llm as default_llm
-from agent.llm import parse_json_safely
+from agent.llm import parse_json_safely, LLMError, LLMRateLimitError
+from agent.narrative import generate_narrative
 
 logger = logging.getLogger("InsightAnalyst.Loop")
 
@@ -276,304 +277,345 @@ def run_agent(
             except Exception as e:
                 logger.warning(f"Error in on_event callback: {e}")
 
-    # Step 1: Retrieve context & Plan
-    emit_event("plan", f"Starting analysis for question: '{question}'")
-    
-    # Retrieve domain facts
-    docs: List[Any] = []
-    retrieve_fn = getattr(loop_module, "retrieve", None) or retriever or default_retrieve
     try:
-        if callable(retrieve_fn):
-            docs = retrieve_fn(question, k=6)
-        elif hasattr(retrieve_fn, "retrieve"):
-            docs = retrieve_fn.retrieve(question, k=6)
-        emit_event("plan", f"Retrieved {len(docs)} knowledge chunks")
-    except Exception as e:
-        logger.warning(f"Retrieval error: {e}")
-        emit_event("plan", f"Retrieval fallback: {e}")
-
-    # Generate Plan
-    plan_fn = getattr(loop_module, "create_plan", None) or default_create_plan
-    plan: Optional[Plan] = None
-    try:
-        plan = plan_fn(question, docs, llm=llm)
-    except TypeError:
+        # Step 1: Retrieve context & Plan
+        emit_event("plan", f"Starting analysis for question: '{question}'")
+        
+        # Retrieve domain facts
+        docs: List[Any] = []
+        retrieve_fn = getattr(loop_module, "retrieve", None) or retriever or default_retrieve
         try:
-            plan = plan_fn(question, docs, llm)
-        except TypeError:
-            plan = plan_fn(question, docs)
-
-    if not plan:
-        emit_event("error", "Planner failed to generate an execution plan")
-        return AgentRun(
-            question=question,
-            plan=None,
-            status="failed",
-            error="Failed to generate execution plan",
-            trace=trace_events
-        )
-
-    # Check for clarification or refusal immediately
-    if plan.needs_clarification:
-        msg = plan.clarification_message or "Clarification required"
-        emit_event("done", f"Question requires clarification: {msg}")
-        return AgentRun(
-            question=question,
-            plan=plan,
-            status="clarify",
-            trace=trace_events,
-            assumptions=plan.assumptions or []
-        )
-
-    if plan.is_refusal:
-        reason = plan.refusal_reason or "Request refused"
-        emit_event("done", f"Question refused by safety guard: {reason}")
-        return AgentRun(
-            question=question,
-            plan=plan,
-            status="refused",
-            error=reason,
-            trace=trace_events,
-            assumptions=plan.assumptions or []
-        )
-
-    # Resolve time windows
-    if plan.time_window:
-        try:
-            resolved_start, resolved_end = resolve_window(plan.time_window)
-            assumptions.append(f"Primary time window: {resolved_start} to {resolved_end}")
+            if callable(retrieve_fn):
+                docs = retrieve_fn(question, k=6)
+            elif hasattr(retrieve_fn, "retrieve"):
+                docs = retrieve_fn.retrieve(question, k=6)
+            emit_event("plan", f"Retrieved {len(docs)} knowledge chunks")
         except Exception as e:
-            assumptions.append(f"Time window spec: {plan.time_window}")
+            logger.warning(f"Retrieval error: {e}")
+            emit_event("plan", f"Retrieval fallback: {e}")
 
-    if plan.comparison_period:
+        # Generate Plan
+        plan_fn = getattr(loop_module, "create_plan", None) or default_create_plan
+        plan: Optional[Plan] = None
         try:
-            comp_start, comp_end = resolve_window(plan.comparison_period)
-            assumptions.append(f"Comparison period: {comp_start} to {comp_end}")
-        except Exception:
-            pass
+            plan = plan_fn(question, docs, llm=llm)
+        except TypeError:
+            try:
+                plan = plan_fn(question, docs, llm)
+            except TypeError:
+                plan = plan_fn(question, docs)
 
-    if plan.assumptions:
-        for asm in plan.assumptions:
-            if asm not in assumptions:
-                assumptions.append(asm)
+        if not plan:
+            emit_event("error", "Planner failed to generate an execution plan")
+            return AgentRun(
+                question=question,
+                plan=None,
+                status="failed",
+                error="Failed to generate execution plan",
+                trace=trace_events
+            )
 
-    emit_event("plan", f"Plan generated with {len(plan.query_list)} queries for metric '{plan.metric}'")
+        # Check for clarification or refusal immediately
+        if plan.needs_clarification:
+            msg = plan.clarification_message or "Clarification required"
+            emit_event("done", f"Question requires clarification: {msg}")
+            return AgentRun(
+                question=question,
+                plan=plan,
+                status="clarify",
+                trace=trace_events,
+                assumptions=plan.assumptions or []
+            )
 
-    # Dynamic query execution queue
-    queries_to_run = list(plan.query_list)
-    if not queries_to_run:
-        emit_event("done", "Plan contains no queries to execute")
-        return AgentRun(
-            question=question,
-            plan=plan,
-            status="complete",
-            findings=[],
-            trace=trace_events,
-            assumptions=assumptions
-        )
+        if plan.is_refusal:
+            reason = plan.refusal_reason or "Request refused"
+            emit_event("done", f"Question refused by safety guard: {reason}")
+            return AgentRun(
+                question=question,
+                plan=plan,
+                status="refused",
+                error=reason,
+                trace=trace_events,
+                assumptions=plan.assumptions or []
+            )
 
-    baseline_analysis: Optional[ContributionAnalysis] = None
-    q_idx = 0
+        # Resolve time windows
+        if plan.time_window:
+            try:
+                resolved_start, resolved_end = resolve_window(plan.time_window)
+                assumptions.append(f"Primary time window: {resolved_start} to {resolved_end}")
+            except Exception as e:
+                assumptions.append(f"Time window spec: {plan.time_window}")
 
-    while queries_to_run and total_query_count < MAX_TOTAL_QUERIES:
-        plan_query = queries_to_run.pop(0)
-        qid = plan_query.query_id or f"Q{q_idx+1}"
-        current_sql = plan_query.sql
-        attempt = 0
-        q_result: Optional[QueryResult] = None
-        query_succeeded = False
-        last_val_results: List[ValidationResult] = []
+        if plan.comparison_period:
+            try:
+                comp_start, comp_end = resolve_window(plan.comparison_period)
+                assumptions.append(f"Comparison period: {comp_start} to {comp_end}")
+            except Exception:
+                pass
 
-        # Retry and Query Repair loop (max 3 retries per query)
-        while attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
-            attempt += 1
-            total_query_count += 1
-            emit_event("query", f"Executing {qid} (attempt {attempt}): {plan_query.purpose}", query_id=qid)
+        if plan.assumptions:
+            for asm in plan.assumptions:
+                if asm not in assumptions:
+                    assumptions.append(asm)
 
-            if executor:
-                q_result = _call_executor(executor, qid, current_sql)
-            else:
-                q_result = QueryResult(query_id=qid, sql=current_sql, error="No executor provided")
+        emit_event("plan", f"Plan generated with {len(plan.query_list)} queries for metric '{plan.metric}'")
 
-            # 1. Execution Check
-            if q_result.error:
-                emit_event("retry", f"{qid} execution error on attempt {attempt}: {q_result.error}", query_id=qid)
+        # Dynamic query execution queue
+        queries_to_run = list(plan.query_list)
+        if not queries_to_run:
+            emit_event("done", "Plan contains no queries to execute")
+            return AgentRun(
+                question=question,
+                plan=plan,
+                status="complete",
+                findings=[],
+                trace=trace_events,
+                assumptions=assumptions
+            )
+
+        baseline_analysis: Optional[ContributionAnalysis] = None
+        q_idx = 0
+
+        while queries_to_run and total_query_count < MAX_TOTAL_QUERIES:
+            plan_query = queries_to_run.pop(0)
+            qid = plan_query.query_id or f"Q{q_idx+1}"
+            current_sql = plan_query.sql
+            attempt = 0
+            q_result: Optional[QueryResult] = None
+            query_succeeded = False
+            last_val_results: List[ValidationResult] = []
+
+            # Retry and Query Repair loop (max 3 retries per query)
+            while attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
+                attempt += 1
+                total_query_count += 1
+                emit_event("query", f"Executing {qid} (attempt {attempt}): {plan_query.purpose}", query_id=qid)
+
+                if executor:
+                    q_result = _call_executor(executor, qid, current_sql)
+                else:
+                    q_result = QueryResult(query_id=qid, sql=current_sql, error="No executor provided")
+
+                # 1. Execution Check
+                if q_result.error:
+                    emit_event("retry", f"{qid} execution error on attempt {attempt}: {q_result.error}", query_id=qid)
+                    if attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
+                        emit_event("retry", f"Calling LLM query repair for {qid} execution error...", query_id=qid)
+                        try:
+                            repaired_sql = repair_query(
+                                question=question,
+                                failed_sql=current_sql,
+                                error_message=q_result.error,
+                                check_name="execution",
+                                schema_chunks=docs,
+                                llm=llm,
+                                error_type="Execution Error"
+                            )
+                            if repaired_sql:
+                                current_sql = repaired_sql
+                        except Exception as repair_err:
+                            emit_event("retry", f"Query repair error: {repair_err}", query_id=qid)
+                        continue
+                    # Reached cap
+                    break
+
+                # 2. Validation Check
+                val_context: Dict[str, Any] = {}
+                if plan.time_window and "Orders" in current_sql:
+                    try:
+                        s, e = resolve_window(plan.time_window)
+                        val_context["date_window"] = {"start": s, "end": e}
+                        val_context["date_column"] = "OrderDate"
+                    except Exception:
+                        pass
+
+                if "dim_country_region" in current_sql:
+                    val_context["required_sql_fragments"] = ["dim_country_region"]
+
+                val_results: List[ValidationResult] = []
+                if validator:
+                    val_results = _call_validator(validator, q_result, context=val_context)
+                    last_val_results = val_results
+                    check_statuses = [v.status for v in val_results]
+                    emit_event("check", f"Validated {qid}: {check_statuses}", query_id=qid)
+
+                # Check for validation failures
+                val_failures = [v for v in val_results if v.status in ("fail", "suspicious")]
+                if not val_failures:
+                    # Succeeded execution and passed validation cleanly!
+                    query_succeeded = True
+                    break
+
+                # Has validation failure -> trigger query repair
+                fail_reasons = "; ".join([f"{f.check_name}: {f.reason}" for f in val_failures])
+                emit_event("retry", f"{qid} validation failed on attempt {attempt}: {fail_reasons}", query_id=qid)
+
                 if attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
-                    emit_event("retry", f"Calling LLM query repair for {qid} execution error...", query_id=qid)
-                    repaired_sql = repair_query(
-                        question=question,
-                        failed_sql=current_sql,
-                        error_message=q_result.error,
-                        check_name="execution",
-                        schema_chunks=docs,
-                        llm=llm,
-                        error_type="Execution Error"
-                    )
-                    if repaired_sql:
-                        current_sql = repaired_sql
+                    first_fail = val_failures[0]
+                    emit_event("retry", f"Calling LLM query repair for {qid} validation failure ({first_fail.check_name})...", query_id=qid)
+                    try:
+                        repaired_sql = repair_query(
+                            question=question,
+                            failed_sql=current_sql,
+                            error_message=first_fail.reason or "Validation check failed",
+                            check_name=first_fail.check_name,
+                            schema_chunks=docs,
+                            llm=llm,
+                            error_type="Validation Failure"
+                        )
+                        if repaired_sql:
+                            current_sql = repaired_sql
+                    except Exception as repair_err:
+                        emit_event("retry", f"Query repair error: {repair_err}", query_id=qid)
                     continue
+
                 # Reached cap
                 break
 
-            # 2. Validation Check
-            val_context: Dict[str, Any] = {}
-            if plan.time_window and "Orders" in current_sql:
-                try:
-                    s, e = resolve_window(plan.time_window)
-                    val_context["date_window"] = {"start": s, "end": e}
-                    val_context["date_column"] = "OrderDate"
-                except Exception:
-                    pass
+            if q_result:
+                executed_queries.append(q_result)
+            if last_val_results:
+                all_validations.extend(last_val_results)
 
-            if "dim_country_region" in current_sql:
-                val_context["required_sql_fragments"] = ["dim_country_region"]
-
-            val_results: List[ValidationResult] = []
-            if validator:
-                val_results = _call_validator(validator, q_result, context=val_context)
-                last_val_results = val_results
-                check_statuses = [v.status for v in val_results]
-                emit_event("check", f"Validated {qid}: {check_statuses}", query_id=qid)
-
-            # Check for validation failures
-            val_failures = [v for v in val_results if v.status in ("fail", "suspicious")]
-            if not val_failures:
-                # Succeeded execution and passed validation cleanly!
-                query_succeeded = True
-                break
-
-            # Has validation failure -> trigger query repair
-            fail_reasons = "; ".join([f"{f.check_name}: {f.reason}" for f in val_failures])
-            emit_event("retry", f"{qid} validation failed on attempt {attempt}: {fail_reasons}", query_id=qid)
-
-            if attempt < MAX_RETRIES_PER_QUERY and total_query_count < MAX_TOTAL_QUERIES:
-                first_fail = val_failures[0]
-                emit_event("retry", f"Calling LLM query repair for {qid} validation failure ({first_fail.check_name})...", query_id=qid)
-                repaired_sql = repair_query(
-                    question=question,
-                    failed_sql=current_sql,
-                    error_message=first_fail.reason or "Validation check failed",
-                    check_name=first_fail.check_name,
-                    schema_chunks=docs,
-                    llm=llm,
-                    error_type="Validation Failure"
-                )
-                if repaired_sql:
-                    current_sql = repaired_sql
+            # After 3 failed attempts, mark query failed, keep going if other queries support partial answer,
+            # and NEVER present failed query numbers as findings.
+            if not query_succeeded:
+                emit_event("error", f"{qid} failed after {attempt} attempts and is marked failed. Numbers will not be presented.", query_id=qid)
+                q_idx += 1
                 continue
 
-            # Reached cap
-            break
+            # Step 3: Analyze baseline result (Q1)
+            if q_idx == 0:
+                if len(q_result.columns or []) >= 3 and q_result.rows:
+                    baseline_analysis = analyze_contribution(q_result)
+                    if baseline_analysis.items:
+                        dir_str = "fell" if baseline_analysis.total_change < 0 else "rose"
+                        headline_finding = Finding(
+                            id="F_headline",
+                            kind="headline",
+                            template=f"Overall {plan.metric or 'metric'} {dir_str} by {{total_abs_change}} ({{total_pct_change}}%) [{{query_id}}]",
+                            values={
+                                "total_abs_change": abs(baseline_analysis.total_change),
+                                "total_pct_change": baseline_analysis.total_pct_change or 0.0,
+                                "total_change": baseline_analysis.total_change,
+                                "prior": baseline_analysis.total_prior,
+                                "current": baseline_analysis.total_current,
+                                "query_id": qid
+                            },
+                            query_id=qid
+                        )
+                        findings.append(headline_finding)
 
-        if q_result:
-            executed_queries.append(q_result)
-        if last_val_results:
-            all_validations.extend(last_val_results)
+                        driver_f = build_driver_finding(baseline_analysis, query_id=qid, metric_name=plan.metric or "revenue")
+                        if driver_f:
+                            findings.append(driver_f)
+                            top_val = baseline_analysis.top_driver.dimension_value
+                            emit_event("drilldown", f"Primary driver identified: {top_val} explaining {baseline_analysis.top_driver.contribution_pct}% of change", query_id=qid)
 
-        # After 3 failed attempts, mark query failed, keep going if other queries support partial answer,
-        # and NEVER present failed query numbers as findings.
-        if not query_succeeded:
-            emit_event("error", f"{qid} failed after {attempt} attempts and is marked failed. Numbers will not be presented.", query_id=qid)
-            q_idx += 1
-            continue
-
-        # Step 3: Analyze baseline result (Q1)
-        if q_idx == 0:
-            if len(q_result.columns or []) >= 3 and q_result.rows:
-                baseline_analysis = analyze_contribution(q_result)
-                if baseline_analysis.items:
-                    dir_str = "fell" if baseline_analysis.total_change < 0 else "rose"
-                    headline_finding = Finding(
-                        id="F_headline",
-                        kind="headline",
-                        template=f"Overall {plan.metric or 'metric'} {dir_str} by {{total_abs_change}} ({{total_pct_change}}%) [{{query_id}}]",
-                        values={
-                            "total_abs_change": abs(baseline_analysis.total_change),
-                            "total_pct_change": baseline_analysis.total_pct_change or 0.0,
-                            "total_change": baseline_analysis.total_change,
-                            "prior": baseline_analysis.total_prior,
-                            "current": baseline_analysis.total_current,
-                            "query_id": qid
-                        },
-                        query_id=qid
+                # Fallback scalar headline if no finding was generated
+                if not findings and q_result.rows:
+                    val = _extract_scalar(q_result)
+                    findings.append(
+                        Finding(
+                            id="F1",
+                            kind="headline",
+                            template=f"{plan_query.purpose}: {{val}} [{{query_id}}]",
+                            values={"val": val if val is not None else 0.0, "query_id": qid},
+                            query_id=qid,
+                            statement=f"{plan_query.purpose} [{qid}]",
+                            value=val,
+                            formatted_value=f"{val:,.2f}" if val is not None else None
+                        )
                     )
-                    findings.append(headline_finding)
 
-                    driver_f = build_driver_finding(baseline_analysis, query_id=qid, metric_name=plan.metric or "revenue")
-                    if driver_f:
-                        findings.append(driver_f)
-                        top_val = baseline_analysis.top_driver.dimension_value
-                        emit_event("drilldown", f"Primary driver identified: {top_val} explaining {baseline_analysis.top_driver.contribution_pct}% of change", query_id=qid)
+                # Step 4: Dynamically generate drill-down query for top contributor if needed
+                if plan.drill_down_dimensions and not queries_to_run and total_query_count < MAX_TOTAL_QUERIES:
+                    drill_dim = plan.drill_down_dimensions[0]
+                    top_val = (
+                        baseline_analysis.top_driver.dimension_value
+                        if baseline_analysis and baseline_analysis.top_driver
+                        else plan.filters.get("region", "South")
+                    )
+                    drill_q = _generate_drilldown_query(plan, top_driver_val=top_val, drill_dim=drill_dim, query_id="Q2")
+                    queries_to_run.append(drill_q)
+                    emit_event("plan", f"Generated dynamic drill-down query Q2 for dimension '{drill_dim}' on top contributor '{top_val}'")
 
-            # Fallback scalar headline if no finding was generated
-            if not findings and q_result.rows:
-                val = _extract_scalar(q_result)
+            elif q_idx > 0 and q_result.rows:
+                # Secondary drilldown finding
+                first_val = _extract_scalar(q_result)
                 findings.append(
                     Finding(
-                        id="F1",
-                        kind="headline",
+                        id=f"F_{qid}",
+                        kind="driver",
                         template=f"{plan_query.purpose}: {{val}} [{{query_id}}]",
-                        values={"val": val if val is not None else 0.0, "query_id": qid},
+                        values={"val": first_val if first_val is not None else 0.0, "query_id": qid},
                         query_id=qid,
-                        statement=f"{plan_query.purpose} [{qid}]",
-                        value=val,
-                        formatted_value=f"{val:,.2f}" if val is not None else None
+                        statement=f"{plan_query.purpose}: {first_val:,.2f} [{qid}]" if first_val is not None else f"{plan_query.purpose} [{qid}]",
+                        value=first_val,
+                        formatted_value=f"{first_val:,.2f}" if first_val is not None else None
                     )
                 )
+                emit_event("drilldown", f"Drill-down finding captured from {qid}", query_id=qid)
 
-            # Step 4: Dynamically generate drill-down query for top contributor if needed
-            if plan.drill_down_dimensions and not queries_to_run and total_query_count < MAX_TOTAL_QUERIES:
-                drill_dim = plan.drill_down_dimensions[0]
-                top_val = (
-                    baseline_analysis.top_driver.dimension_value
-                    if baseline_analysis and baseline_analysis.top_driver
-                    else plan.filters.get("region", "South")
-                )
-                drill_q = _generate_drilldown_query(plan, top_driver_val=top_val, drill_dim=drill_dim, query_id="Q2")
-                queries_to_run.append(drill_q)
-                emit_event("plan", f"Generated dynamic drill-down query Q2 for dimension '{drill_dim}' on top contributor '{top_val}'")
+            q_idx += 1
 
-        elif q_idx > 0 and q_result.rows:
-            # Secondary drilldown finding
-            first_val = _extract_scalar(q_result)
-            findings.append(
-                Finding(
-                    id=f"F_{qid}",
-                    kind="driver",
-                    template=f"{plan_query.purpose}: {{val}} [{{query_id}}]",
-                    values={"val": first_val if first_val is not None else 0.0, "query_id": qid},
-                    query_id=qid,
-                    statement=f"{plan_query.purpose}: {first_val:,.2f} [{qid}]" if first_val is not None else f"{plan_query.purpose} [{qid}]",
-                    value=first_val,
-                    formatted_value=f"{first_val:,.2f}" if first_val is not None else None
-                )
-            )
-            emit_event("drilldown", f"Drill-down finding captured from {qid}", query_id=qid)
+        # Generate narrative summary using agent/narrative.py if findings exist
+        if findings:
+            try:
+                narr_res = generate_narrative(findings, question, llm=llm)
+                if narr_res and narr_res.filled_text:
+                    assumptions.append(f"Narrative Summary: {narr_res.filled_text}")
+            except Exception as e:
+                logger.warning(f"Narrative generation fallback: {e}")
 
-        q_idx += 1
+        # Determine final status
+        status = "complete"
+        failed_queries = [q for q in executed_queries if q.error]
+        if len(findings) == 0:
+            status = "failed"
+        elif failed_queries or len(executed_queries) < len(plan.query_list):
+            status = "partial"
 
-    # Determine final status
-    status = "complete"
-    failed_queries = [q for q in executed_queries if q.error]
-    # Also treat un-succeeded validation queries as failed
-    if len(findings) == 0:
-        status = "failed"
-    elif failed_queries or len(executed_queries) < len(plan.query_list):
-        status = "partial"
+        emit_event("done", f"Agent run completed with status '{status}' and {len(findings)} traceable findings")
 
-    emit_event("done", f"Agent run completed with status '{status}' and {len(findings)} traceable findings")
+        return AgentRun(
+            question=question,
+            plan=plan,
+            queries=executed_queries,
+            validations=all_validations,
+            findings=findings,
+            trace=trace_events,
+            assumptions=assumptions,
+            status=status,
+            error=None if status != "failed" else "All queries failed"
+        )
 
-    return AgentRun(
-        question=question,
-        plan=plan,
-        queries=executed_queries,
-        validations=all_validations,
-        findings=findings,
-        trace=trace_events,
-        assumptions=assumptions,
-        status=status,
-        error=None if status != "failed" else "All queries failed"
-    )
+    except Exception as e:
+        err_str = str(e)
+        if "readonly" in err_str.lower() and "cache" in err_str.lower():
+            error_msg = f"Cache miss in readonly mode: {e}"
+        elif isinstance(e, LLMRateLimitError) or "rate limit" in err_str.lower() or "429" in err_str:
+            error_msg = f"LLM rate limit reached: {e}"
+        elif isinstance(e, LLMError):
+            error_msg = f"LLM provider error: {e}"
+        else:
+            error_msg = f"Execution error: {e}"
+
+        logger.warning(f"run_agent caught error: {error_msg}")
+        emit_event("error", error_msg)
+        final_status = "partial" if findings else "failed"
+        return AgentRun(
+            question=question,
+            plan=plan if "plan" in locals() else None,
+            queries=executed_queries,
+            validations=all_validations,
+            findings=findings,
+            trace=trace_events,
+            assumptions=assumptions,
+            status=final_status,
+            error=error_msg
+        )
 
 
 # Alias module pointer for monkeypatching in unit tests
@@ -610,7 +652,13 @@ def run_agent_loop(
     for q in run.queries:
         vr_dict[q.query_id] = list(run.validations)
 
-    headline = run.findings[0].render() if run.findings else ""
+    headline = ""
+    for a in run.assumptions:
+        if a.startswith("Narrative Summary: "):
+            headline = a.replace("Narrative Summary: ", "").strip()
+            break
+    if not headline and run.findings:
+        headline = run.findings[0].render()
 
     return AgentResponse(
         question=question,
