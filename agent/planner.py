@@ -150,7 +150,11 @@ def plan(question: str, context_chunks: List[Dict[str, Any]], llm: Any = None) -
 
 
 # Backwards-compatible alias for existing callers
-def create_plan(question: str, retrieved_context: List[Dict[str, Any]]) -> Plan:
+def create_plan(
+    question: str,
+    retrieved_context: List[Dict[str, Any]],
+    llm: Optional[Any] = None
+) -> Plan:
     """Helper alias preserving compatibility with earlier tests and loop."""
     # Fast check for refusal if asked to drop or delete
     q_lower = question.lower()
@@ -162,7 +166,7 @@ def create_plan(question: str, retrieved_context: List[Dict[str, Any]]) -> Plan:
                 is_refusal=True,
                 refusal_reason=f"Action '{kw.upper()}' violates read-only safety guard."
             )
-    return plan(question, retrieved_context, default_llm)
+    return plan(question, retrieved_context, llm or default_llm)
 
 
 if __name__ == "__main__":
