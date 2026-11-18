@@ -607,8 +607,8 @@ def run_agent_loop(
 
     qr_dict = {q.query_id: q for q in run.queries}
     vr_dict: Dict[str, List[ValidationResult]] = {}
-    for v in run.validations:
-        vr_dict.setdefault("validation", []).append(v)
+    for q in run.queries:
+        vr_dict[q.query_id] = list(run.validations)
 
     headline = run.findings[0].render() if run.findings else ""
 
