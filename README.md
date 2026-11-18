@@ -34,5 +34,5 @@ Setup & Installation
 Contributors:
 1. Srigadde Sukrutha (1CR24CS186)
 2. Harini RK (1CR24CS071)
-3. Archanaa AM (1CR24CS030)
+3. Archanaa A M (1CR24CS030)
 4. Hannan Israili (1CR24CS070)
