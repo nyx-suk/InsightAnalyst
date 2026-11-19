@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts import Plan, PlanQuery, QueryResult, ValidationResult, TraceEvent, AgentRun
-from agent.loop import run_agent, MAX_TOTAL_QUERIES, MAX_RETRIES_PER_QUERY
+from agent.loop import run_agent, repair_query, MAX_TOTAL_QUERIES, MAX_RETRIES_PER_QUERY
 from agent.llm import LLMError, LLMRateLimitError
 
 
@@ -616,6 +616,35 @@ class TestAgentLoopPrompt33(unittest.TestCase):
         self.assertIn("retry", event_types)
         self.assertIn("check", event_types)
         self.assertIn("done", event_types)
+
+    def test_regression_repair_query_nested_cte_scoping(self):
+        """Verifies repair_query deterministically and cleanly fixes nested CTE alias scoping errors."""
+        broken_sql = """
+WITH top_products AS (
+  SELECT json_group_array(
+    json_object('product_name', p.ProductName, 'product_revenue', prod_rev)
+  )
+  FROM (
+    SELECT p.ProductName, SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) AS prod_rev
+    FROM [Order Details] od
+    JOIN Products p ON od.ProductID = p.ProductID
+    GROUP BY p.ProductName
+    ORDER BY prod_rev DESC
+    LIMIT 5
+  ) sub
+)
+SELECT * FROM top_products;
+"""
+        repaired = repair_query(
+            question="What are our top 5 products?",
+            failed_sql=broken_sql,
+            error_message="SQL_EXECUTION_ERROR: no such column: p.ProductName",
+            check_name="execution"
+        )
+        self.assertIsNotNone(repaired)
+        self.assertIn("sub.ProductName", repaired)
+        self.assertIn("sub.prod_rev", repaired)
+        self.assertNotIn("p.ProductName", repaired.split("FROM (")[0])
 
 
 if __name__ == "__main__":

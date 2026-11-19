@@ -28,7 +28,7 @@ from contracts import (
     ValidationResult
 )
 from knowledge.retriever import retrieve as default_retrieve
-from agent.planner import create_plan as default_create_plan
+from agent.planner import create_plan as default_create_plan, fix_nested_cte_scoping
 from agent.timewindow import resolve_window
 from agent.contribution import (
     analyze_contribution,
@@ -135,6 +135,26 @@ def _extract_primary_metric_value(
     time_terms = ["month", "ordermonth", "date", "orderdate", "period", "year", "quarter"]
     id_terms = ["id", "orderid", "customerid", "productid", "categoryid"]
 
+    target_time_terms = []
+    if time_window:
+        if isinstance(time_window, dict):
+            val_str = str(time_window.get("value", "")).lower()
+            if "last_complete_month" in val_str or "current" in val_str:
+                target_time_terms.extend(["september", "sep", "current", "latest"])
+            elif "previous" in val_str or "prior" in val_str:
+                target_time_terms.extend(["august", "aug", "prior", "previous"])
+        elif isinstance(time_window, str):
+            target_time_terms.append(time_window.lower())
+    if question:
+        q_lower = question.lower()
+        for m_name, m_abbr in [
+            ("january", "jan"), ("february", "feb"), ("march", "mar"), ("april", "apr"),
+            ("may", "may"), ("june", "jun"), ("july", "jul"), ("august", "aug"),
+            ("september", "sep"), ("october", "oct"), ("november", "nov"), ("december", "dec")
+        ]:
+            if m_name in q_lower or m_abbr in q_lower:
+                target_time_terms.extend([m_name, m_abbr])
+
     scored_cols = []
     for idx, c in enumerate(cols_lower):
         if any(term in c for term in time_terms) or any(term in c for term in id_terms):
@@ -155,6 +175,8 @@ def _extract_primary_metric_value(
                 score = 20
 
         if score > 0:
+            if target_time_terms and any(term in c for term in target_time_terms):
+                score += 15
             scored_cols.append((score, idx, cols[idx]))
 
     scored_cols.sort(key=lambda x: x[0], reverse=True)
@@ -231,7 +253,10 @@ def _extract_primary_metric_value(
         if idx != metric_idx and idx != time_col_idx:
             cell_val = selected_row[idx]
             if cell_val is not None and not isinstance(cell_val, (int, float)):
-                entity_label = str(cell_val).strip()
+                cell_str = str(cell_val).strip()
+                if cell_str.startswith(("{", "[")):
+                    continue
+                entity_label = cell_str
                 break
 
     return val, col_name, entity_label
@@ -365,6 +390,13 @@ def repair_query(
         .replace("{error_message}", error_message)
     )
 
+    # Deterministic fast-path: detect and repair nested CTE alias scoping errors immediately
+    if "no such column" in error_message.lower():
+        deterministic_fix = fix_nested_cte_scoping(failed_sql)
+        if deterministic_fix != failed_sql:
+            logger.info("Deterministic repair: fixed nested CTE alias scoping in SQL.")
+            return deterministic_fix
+
     active_llm = llm or default_llm
     parsed = None
 
@@ -383,6 +415,7 @@ def repair_query(
 
     if isinstance(parsed, dict) and "sql" in parsed:
         repaired_sql = str(parsed["sql"]).strip()
+        repaired_sql = fix_nested_cte_scoping(repaired_sql)
         upper_sql = repaired_sql.upper()
         forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA"]
         if any(f"{kw} " in upper_sql or f" {kw}" in upper_sql for kw in forbidden):
@@ -670,7 +703,7 @@ def run_agent(
         while queries_to_run and total_query_count < MAX_TOTAL_QUERIES:
             plan_query = queries_to_run.pop(0)
             qid = plan_query.query_id or f"Q{q_idx+1}"
-            current_sql = plan_query.sql
+            current_sql = fix_nested_cte_scoping(plan_query.sql)
             attempt = 0
             q_result: Optional[QueryResult] = None
             query_succeeded = False

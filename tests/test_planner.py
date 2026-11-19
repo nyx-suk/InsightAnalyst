@@ -12,7 +12,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts import Plan
-from agent.planner import plan, validate_plan_dict, _load_prompt_template
+from agent.planner import plan, validate_plan_dict, _load_prompt_template, fix_nested_cte_scoping
+from executor import execute_query
 import agent.llm as default_llm
 from agent.llm import register_fake_response, clear_fake_responses
 
@@ -186,6 +187,93 @@ class TestPlanner(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             validate_plan_dict(invalid_refusal)
         self.assertIn("must not produce any SQL queries", str(ctx.exception))
+
+    def test_regression_nested_cte_scoping_fix(self):
+        """Regression test for Person B issue: outer query references inner alias p.ProductName instead of sub.ProductName."""
+        broken_sql = """
+WITH top_products AS (
+  SELECT json_group_array(
+    json_object('product_name', p.ProductName, 'product_revenue', prod_rev)
+  )
+  FROM (
+    SELECT p.ProductName, SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) AS prod_rev
+    FROM [Order Details] od
+    JOIN Products p ON od.ProductID = p.ProductID
+    GROUP BY p.ProductName
+    ORDER BY prod_rev DESC
+    LIMIT 5
+  ) sub
+)
+SELECT * FROM top_products;
+"""
+        # 1. Verify broken SQL actually fails in executor with the exact reported error
+        qr_broken = execute_query("Q_broken", broken_sql)
+        self.assertIsNotNone(qr_broken.error)
+        self.assertIn("no such column: p.ProductName", qr_broken.error)
+
+        # 2. Fix scoping with fix_nested_cte_scoping
+        fixed_sql = fix_nested_cte_scoping(broken_sql)
+        self.assertIn("sub.ProductName", fixed_sql)
+        self.assertIn("sub.prod_rev", fixed_sql)
+        # Ensure outer SELECT clause before FROM ( no longer has p.ProductName
+        outer_part = fixed_sql.split("FROM (")[0]
+        self.assertNotIn("p.ProductName", outer_part)
+
+        # 3. Verify fixed SQL executes cleanly in executor and returns valid results
+        qr_fixed = execute_query("Q_fixed", fixed_sql)
+        self.assertIsNone(qr_fixed.error)
+        self.assertEqual(qr_fixed.row_count, 1)
+        self.assertTrue(len(qr_fixed.rows) > 0)
+        # Output should be valid JSON containing Côte de Blaye
+        raw_json = qr_fixed.rows[0][0]
+        self.assertIn("Côte de Blaye", raw_json)
+
+    def test_regression_plan_cleans_nested_cte_scoping(self):
+        """Regression test verifying that plan() automatically fixes nested CTE queries from the LLM."""
+        broken_sql = """
+WITH top_products AS (
+  SELECT json_group_array(
+    json_object('product_name', p.ProductName, 'product_revenue', prod_rev)
+  )
+  FROM (
+    SELECT p.ProductName, SUM(od.UnitPrice * od.Quantity * (1 - od.Discount)) AS prod_rev
+    FROM [Order Details] od
+    JOIN Products p ON od.ProductID = p.ProductID
+    GROUP BY p.ProductName
+    LIMIT 5
+  ) sub
+)
+SELECT * FROM top_products;
+"""
+        mock_response = {
+            "question": "What are our top 5 products?",
+            "metric": "revenue",
+            "time_window": {"type": "relative", "value": "last_complete_month"},
+            "comparison_window": None,
+            "filters": {},
+            "drill_down_dimensions": ["product"],
+            "queries": [
+                {
+                    "query_id": "Q1",
+                    "purpose": "Top 5 products CTE",
+                    "sql": broken_sql
+                }
+            ],
+            "assumptions": [],
+            "needs_clarification": False,
+            "clarification_question": None,
+            "refused": False,
+            "refusal_reason": None
+        }
+        mock_llm = MockLLM(mock_response)
+        p = plan("What are our top 5 products?", [], llm=mock_llm)
+        self.assertEqual(len(p.query_list), 1)
+        cleaned_sql = p.query_list[0].sql
+        self.assertIn("sub.ProductName", cleaned_sql)
+        self.assertIn("sub.prod_rev", cleaned_sql)
+        # Verify it executes cleanly
+        qr = execute_query("Q1", cleaned_sql)
+        self.assertIsNone(qr.error)
 
 
 if __name__ == "__main__":

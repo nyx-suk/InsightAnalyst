@@ -12,6 +12,9 @@ CRITICAL RULES:
 4. Revenue formula: SUM(UnitPrice * Quantity * (1 - Discount)). NEVER include Freight in revenue calculations.
 5. Regional geography: Always join Customers.Country = dim_country_region.Country to determine sales region (South, North, Europe). NEVER join EmployeeTerritories or Region tables for customer sales geography.
 6. Address the exact root cause described in the error details (e.g. invalid column name, missing join path, date range mismatch, or breakdown reconciliation failure).
+7. Subquery & CTE alias scoping: If an error states 'no such column: <alias>.<column>' (e.g., 'no such column: p.ProductName') in a nested subquery or CTE such as:
+   SELECT json_group_array(json_object('product_name', p.ProductName, ...)) FROM (SELECT p.ProductName, ... FROM Products p ...) sub
+   The outer query cannot see table alias 'p' from inside the subquery. Replace 'p.ProductName' with 'sub.ProductName' and 'prod_rev' with 'sub.prod_rev' (or the matching outer subquery alias).
 
 === CONTEXT ===
 ORIGINAL QUESTION:
