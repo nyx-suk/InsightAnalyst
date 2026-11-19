@@ -66,6 +66,9 @@ chroma_db/
 .cache/
 .llm_cache/
 
+# Generated local reports
+insightanalyst_report.md
+
 # IDE & Editor files
 .vscode/
 .idea/

@@ -122,21 +122,150 @@ class ValidationResult:
 
 @dataclass
 class Finding:
-    """A verified analytical finding holding a statement linked to a query ID."""
-    statement: str                         # e.g., "South region revenue fell 18%"
-    value: Optional[float] = None          # Numeric value
-    formatted_value: Optional[str] = None  # e.g., "$12,450.00" or "-18.2%"
+    """
+    A verified analytical finding holding a template, values, and query ID.
+    Key rule: Numbers appear only in values and are filled into template by code.
+    The LLM never types a number directly in findings.
+    """
+    id: str = ""                           # e.g., "F1", "headline"
+    kind: str = "headline"                 # 'headline' | 'driver' | 'trend'
+    template: str = ""                     # e.g., "South revenue fell {pct_change} [{query_id}]"
+    values: Dict[str, Any] = field(default_factory=dict) # placeholder name -> number/str
     query_id: str = ""                     # e.g., "Q1" - required for traceability
-    dimension: Optional[str] = None        # e.g., "region", "product", "time"
+
+    # Backward compatibility fields for earlier phases and integration tests
+    statement: str = ""
+    value: Optional[float] = None
+    formatted_value: Optional[str] = None
+    dimension: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def render(self) -> str:
+        """Fill placeholder values and query_id into template safely."""
+        tmpl = self.template or self.statement
+        if not tmpl:
+            return ""
+        kwargs = dict(self.values)
+        if "query_id" not in kwargs and self.query_id:
+            kwargs["query_id"] = self.query_id
+        try:
+            return tmpl.format(**kwargs)
+        except Exception:
+            out = tmpl
+            for k, v in kwargs.items():
+                out = out.replace(f"{{{k}}}", str(v))
+            return out
+
+    def __post_init__(self):
+        if not self.statement and self.template:
+            self.statement = self.render()
+        elif not self.template and self.statement:
+            self.template = self.statement
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Finding":
+        return cls(
+            id=data.get("id", ""),
+            kind=data.get("kind", "headline"),
+            template=data.get("template", data.get("statement", "")),
+            values=data.get("values", {}),
+            query_id=data.get("query_id", ""),
+            statement=data.get("statement", ""),
+            value=data.get("value"),
+            formatted_value=data.get("formatted_value"),
+            dimension=data.get("dimension"),
+            metadata=data.get("metadata", {})
+        )
+
+
+@dataclass
+class TraceEvent:
+    """
+    A structured event emitted during agent loop execution.
+    events: 'plan' | 'query' | 'check' | 'retry' | 'drilldown' | 'done' | 'error'
+    """
+    step: int
+    event: str                             # 'plan' | 'query' | 'check' | 'retry' | 'drilldown' | 'done' | 'error'
+    message: str
+    query_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TraceEvent":
+        return cls(
+            step=data.get("step", 0),
+            event=data.get("event", ""),
+            message=data.get("message", ""),
+            query_id=data.get("query_id")
+        )
+
+
+@dataclass
+class AgentRun:
+    """
+    The complete record of an agent run over a user question.
+    status: 'complete' | 'partial' | 'failed' | 'clarify' | 'refused'
+    """
+    question: str
+    plan: Optional[Plan] = None
+    queries: List[QueryResult] = field(default_factory=list)
+    validations: List[ValidationResult] = field(default_factory=list)
+    findings: List[Finding] = field(default_factory=list)
+    trace: List[TraceEvent] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    status: str = "complete"               # 'complete' | 'partial' | 'failed' | 'clarify' | 'refused'
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AgentRun":
+        raw_plan = data.get("plan")
+        plan = None
+        if isinstance(raw_plan, dict):
+            plan = Plan.from_dict(raw_plan)
+        elif isinstance(raw_plan, Plan):
+            plan = raw_plan
+
+        queries = [
+            QueryResult.from_dict(q) if isinstance(q, dict) else q
+            for q in data.get("queries", [])
+        ]
+        validations = [
+            ValidationResult.from_dict(v) if isinstance(v, dict) else v
+            for v in data.get("validations", [])
+        ]
+        findings = [
+            Finding.from_dict(f) if isinstance(f, dict) else f
+            for f in data.get("findings", [])
+        ]
+        trace = [
+            TraceEvent.from_dict(t) if isinstance(t, dict) else t
+            for t in data.get("trace", [])
+        ]
+
+        return cls(
+            question=data.get("question", ""),
+            plan=plan,
+            queries=queries,
+            validations=validations,
+            findings=findings,
+            trace=trace,
+            assumptions=data.get("assumptions", []),
+            status=data.get("status", "complete"),
+            error=data.get("error")
+        )
+
 
 @dataclass
 class AgentResponse:
-    """The complete response assembled at the end of the agent loop."""
+    """The complete response assembled at the end of the agent loop (backward compatibility)."""
     question: str
     status: str                            # "success", "needs_clarification", "refused", "error"
     headline: str = ""

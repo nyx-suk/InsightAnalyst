@@ -4,6 +4,7 @@ Tests 10 sample business questions against knowledge retrieval and reports the a
 """
 
 import sys
+import unittest
 from pathlib import Path
 
 # Add project root to sys.path
@@ -100,7 +101,18 @@ def run_retrieval_check():
     assert "metric_revenue" in test_ids, "Acceptance Test Failed: 'metric_revenue' not in top results"
     assert "rule_region_mapping" in test_ids, "Acceptance Test Failed: 'rule_region_mapping' not in top results"
     print("Acceptance Test PASSED: Headline question returns 'metric_revenue' and 'rule_region_mapping'.")
+    return hit_rate
+
+
+class TestRetrievalAcceptance(unittest.TestCase):
+    def test_prompt_1_6_retrieval_acceptance(self):
+        """Prompt 1.6 Acceptance: Revenue question returns revenue definition and region rule."""
+        test_q = "Why did sales drop in the South region last month?"
+        test_chunks = retrieve(test_q, k=6)
+        test_ids = [c["id"] for c in test_chunks]
+        self.assertIn("metric_revenue", test_ids)
+        self.assertIn("rule_region_mapping", test_ids)
 
 
 if __name__ == "__main__":
-    run_retrieval_check()
+    unittest.main()
