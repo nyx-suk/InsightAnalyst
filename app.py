@@ -140,25 +140,40 @@ def _is_running_in_streamlit() -> bool:
     """Checks if currently executing inside an active Streamlit runtime across all versions."""
     if not HAS_STREAMLIT:
         return False
-    # Check Streamlit internal flag
+
+    # 1. Official Streamlit runtime check (Streamlit >= 1.12)
+    try:
+        from streamlit.runtime import exists
+        return bool(exists())
+    except (ImportError, AttributeError):
+        pass
+
+    # 2. Check if launched via Streamlit CLI or bootstrap
+    if any(m in sys.modules for m in ("streamlit.web.bootstrap", "streamlit.web.cli", "streamlit.cli")):
+        return True
+
+    # 3. Streamlit legacy flag check
     if getattr(st, "_is_running_with_streamlit", False):
         return True
-    # Check command-line invocation arguments
+
+    # 4. Check command-line invocation arguments
     if any("streamlit" in str(arg).lower() for arg in sys.argv):
         return True
-    # Check ScriptRunContext across all Streamlit version module paths
+
+    # 5. Check ScriptRunContext across legacy Streamlit versions (< 1.12)
     for mod_path in [
-        "streamlit.runtime.scriptrunner",
         "streamlit.scriptrunner",
-        "streamlit.report_thread"
+        "streamlit.report_thread",
     ]:
         try:
-            mod = __import__(mod_path, fromlist=["get_script_run_context", "get_report_ctx"])
-            fn = getattr(mod, "get_script_run_context", getattr(mod, "get_report_ctx", None))
-            if fn and fn() is not None:
-                return True
+            mod = __import__(mod_path, fromlist=["get_script_run_ctx", "get_report_ctx"])
+            for fn_name in ["get_script_run_ctx", "get_report_ctx"]:
+                fn = getattr(mod, fn_name, None)
+                if fn and fn() is not None:
+                    return True
         except Exception:
             pass
+
     return False
 
 
