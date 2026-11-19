@@ -31,11 +31,16 @@ InsightAnalyst/
 │   └── repair.txt         # Prompt for diagnostic query repair on execution/validation errors
 ├── scripts/
 │   ├── check_demo.py      # Strict offline regression checker (CACHE_MODE=readonly)
+│   ├── evaluate_golden_set.py # Automated 18-question golden set accuracy & traceability benchmark runner
 │   ├── run_once.py        # Single-query CLI inspection pipeline
 │   └── warm_cache.py      # Cache pre-warmer seeding .cache/llm/ for demo questions
-├── tests/                 # Automated test suite (91 offline unit & integration tests)
+├── tests/                 # Automated test suite (116 offline unit & integration tests)
+│   ├── golden_set.json    # 18 hand-verified business benchmark questions with ground truth SQL
+│   └── golden_evaluation_report.md # Generated evaluation scorecard (100% accuracy)
+├── app.py                 # Streamlit web application with live trace & audit accordions
 ├── contracts.py           # Shared dataclasses (Plan, QueryResult, ValidationResult, Finding, AgentRun)
 ├── executor.py            # Read-only SQLite query executor with query-only mode and authorizer
+├── reporter.py            # Traceable Markdown report generator & Plotly visualization engine
 ├── validator.py           # Multi-point result validation (nulls, empty, date window, reconciliation)
 ├── requirements.txt       # Minimal Python dependencies
 └── .env.example           # Environment variable template
@@ -129,6 +134,53 @@ To guarantee that the LLM never hallucinates numerical figures:
 
 ---
 
+## Data, Trust & Delivery Architecture (Person B)
+
+### 1. Secure SQL Execution & Authorizer (`executor.py`)
+- **Strict Read-Only Connection**: SQLite opened in URI read-only mode (`file:data/northwind.db?mode=ro`).
+- **SELECT-Only Guard**: Queries must begin strictly with `SELECT` or `WITH`. Rejects multiple statements (semicolon attacks), `PRAGMA`, `ATTACH`, `DETACH`, and all DML/DDL write keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`).
+- **Audit Logging**: Any blocked execution attempts are captured in `BlockedQueryLog` without halting the system.
+
+### 2. Multi-Point Result Validation (`validator.py`)
+Runs 6 automated sanity checks on every executed query:
+1. **Execution Check**: Captures syntax errors and missing tables/columns.
+2. **Empty Result Check**: Flags suspicious 0-row returns.
+3. **Null Value Check**: Audits results for missing or null data.
+4. **Date Window Check**: Verifies returned dates fall within the requested period.
+5. **Metric Definition Check**: Validates that required formula expressions exist in the SQL.
+6. **Reconciliation Check**: Ensures dimension breakdowns sum to the aggregate total within a $\pm 0.01$ tolerance.
+
+### 3. Traceable Business Reporter (`reporter.py`)
+- **Zero-Hallucination Delivery**: Numbers appear only in `Finding.values` and are filled into templates by Python code. Every number stated in the report is bound to an executed query citation (e.g. `[Q1]`, `[Q2]`).
+- **Report Specification**:
+  1. *Headline Answer* (with `[Q1]` citation).
+  2. *Key Drivers* (ranked contributors with `[Q#]` citations).
+  3. *Interactive Visualizations* (Trend Chart & Driver Breakdown).
+  4. *Assumptions & Business Rules* (date anchoring, formulas, region join).
+  5. *Evidence Appendix* (executed SQL, result tables, validation checks).
+- **Plotly Visualizations**:
+  - `generate_trend_chart`: Period-over-period comparison bar/line chart.
+  - `generate_driver_chart`: Horizontal bar chart ranking dimensional contributors.
+  - Generates lightweight `ChartSpec` fallbacks in minimal environments.
+
+### 4. Interactive Streamlit Dashboard (`app.py`)
+- **Question Input**: Natural language prompt input with 6 quick-launch demo and guardrail presets.
+- **Live Reasoning Trace**: Real-time visual stepper tracking `TraceEvent` milestones (`plan` → `query` → `check` → `retry` → `drilldown` → `done`).
+- **Visual Analytics**: Interactive Plotly figures alongside headline KPI cards.
+- **Auditable Query Accordions**: Deep inspection of executed SQL statements, row counts, data tables, and sanity check results per query ID.
+- **Report Download**: Instant export of traceable Markdown reports (`insightanalyst_report.md`).
+
+### 5. 18-Question Golden Benchmark Set & Evaluation Runner (`tests/golden_set.json` & `scripts/evaluate_golden_set.py`)
+- **Ground Truth Grounding**: 18 benchmark questions with hand-verified reference SQL and expected numbers computed directly from Northwind SQLite.
+- **Mandatory Trap Cases Tested**:
+  - *Relative Date Window*: Anchoring "last month" to September 2023 (`2023-09`).
+  - *Join Fan-Out*: Proving single-region mapping via `dim_country_region` avoids revenue duplication.
+  - *Ambiguous Query*: Vague question triggers clarification request (`needs_clarification=True`).
+  - *Write Refusal*: Malicious query triggers safety refusal (`refused=True`).
+- **Automated Scorecard**: Measures numeric accuracy ($\ge 85\%$), query traceability ($100\%$), and write guardrail blocks ($100\%$). Scorecard published to `tests/golden_evaluation_report.md`.
+
+---
+
 ## Setup & Installation
 
 ### 1. Clone the Repository
@@ -171,6 +223,11 @@ cp .env.example .env
 
 ## Running the Agent & Verification
 
+### Launch Interactive Streamlit Web App
+```bash
+streamlit run app.py
+```
+
 ### Run Single Query Pipeline
 ```bash
 python3 scripts/run_once.py "Why did sales drop in the South region last month?"
@@ -187,11 +244,34 @@ Runs 100% offline with `CACHE_MODE=readonly`:
 python3 scripts/check_demo.py
 ```
 
-### Run Full Test Suite
-Executes all 91 offline unit and integration tests:
+### Run 18-Question Golden Benchmark Evaluation
+Runs the full evaluation benchmark and writes `tests/golden_evaluation_report.md`:
 ```bash
-python3 -m unittest discover tests
+python3 scripts/evaluate_golden_set.py
 ```
+
+### Run Full Test Suite
+Executes all 116 offline unit and integration tests:
+```bash
+python3 -m unittest discover -v
+```
+
+---
+
+## Security Review & Licensing Compliance
+
+- **Zero Hardcoded Secrets**: Comprehensive regex scans across the entire git commit history confirmed 0 leaked keys or credentials. Real keys reside strictly in untracked `.env` files.
+- **Read-Only Database Enforcement**: All 15 security tests pass in `tests/test_executor.py`. DDL (`DROP`, `ALTER`, `CREATE`), DML (`INSERT`, `UPDATE`, `DELETE`), stacked statements, `PRAGMA`, and database attachment exploits are strictly blocked.
+- **Privacy & No PII**: Logs record only operational metadata (query latency, cache hit/miss, query IDs). No user personal identifiers are stored.
+- **Open-Source Licenses**:
+  - `sqlite3`: Public Domain (Python Standard Library)
+  - `chromadb`: Apache License 2.0
+  - `streamlit`: Apache License 2.0
+  - `plotly`: MIT License
+  - `pyyaml`: MIT License
+  - `python-dotenv`: BSD-3-Clause
+  - `google-genai`: Apache License 2.0
+  - `Northwind Dataset`: Permissive public sample dataset
 
 ---
 
