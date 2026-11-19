@@ -107,6 +107,7 @@ class ValidationResult:
     status: str                            # "pass", "fail", or "suspicious"
     reason: Optional[str] = None           # Details if fail or suspicious
     check_name: str = ""                   # Name of check (e.g., "reconciliation", "execution")
+    query_id: Optional[str] = None         # Query ID this check applies to (e.g., "Q1", "Q2")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -116,7 +117,8 @@ class ValidationResult:
         return cls(
             status=data.get("status", "pass"),
             reason=data.get("reason"),
-            check_name=data.get("check_name", "")
+            check_name=data.get("check_name", ""),
+            query_id=data.get("query_id")
         )
 
 

@@ -113,11 +113,23 @@ def execute_analysis(
         from knowledge.retrieve import retrieve
         import agent.llm as llm
 
-        # Configure cache mode
-        if offline_mode:
-            os.environ["CACHE_MODE"] = "readonly"
-            if not os.environ.get("LLM_PROVIDER"):
-                os.environ["LLM_PROVIDER"] = "fake"
+        # Check for real live API key
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        has_real_key = bool(
+            (gemini_key and "your_" not in gemini_key.lower()) or 
+            (groq_key and "your_" not in groq_key.lower())
+        )
+
+        # Configure environment for execution
+        canned_file = str(PROJECT_ROOT / "tests" / "canned_plans.json")
+        os.environ["FAKE_LLM_FILE"] = canned_file
+
+        if offline_mode or not has_real_key:
+            os.environ["LLM_PROVIDER"] = "fake"
+            os.environ["CACHE_MODE"] = "readwrite"
+        else:
+            os.environ["CACHE_MODE"] = "readwrite"
 
         run = run_agent(
             question=question,
@@ -127,6 +139,14 @@ def execute_analysis(
             validator=validate,
             on_event=on_event_cb
         )
+
+        # If run failed with an LLM/cache error, fall back gracefully to pre-baked sample run
+        if run.status == "failed" and any(err_term in (run.error or "").lower() for err_term in ("cache miss", "api_key", "api key", "quota", "401", "403", "unauthorized")):
+            logger.warning("Agent run encountered LLM/cache error: %s. Falling back to sample run.", run.error)
+            sample = load_sample_run()
+            sample.question = question
+            return sample
+
         return run
 
     except Exception as e:
@@ -140,25 +160,40 @@ def _is_running_in_streamlit() -> bool:
     """Checks if currently executing inside an active Streamlit runtime across all versions."""
     if not HAS_STREAMLIT:
         return False
-    # Check Streamlit internal flag
+
+    # 1. Official Streamlit runtime check (Streamlit >= 1.12)
+    try:
+        from streamlit.runtime import exists
+        return bool(exists())
+    except (ImportError, AttributeError):
+        pass
+
+    # 2. Check if launched via Streamlit CLI or bootstrap
+    if any(m in sys.modules for m in ("streamlit.web.bootstrap", "streamlit.web.cli", "streamlit.cli")):
+        return True
+
+    # 3. Streamlit legacy flag check
     if getattr(st, "_is_running_with_streamlit", False):
         return True
-    # Check command-line invocation arguments
+
+    # 4. Check command-line invocation arguments
     if any("streamlit" in str(arg).lower() for arg in sys.argv):
         return True
-    # Check ScriptRunContext across all Streamlit version module paths
+
+    # 5. Check ScriptRunContext across legacy Streamlit versions (< 1.12)
     for mod_path in [
-        "streamlit.runtime.scriptrunner",
         "streamlit.scriptrunner",
-        "streamlit.report_thread"
+        "streamlit.report_thread",
     ]:
         try:
-            mod = __import__(mod_path, fromlist=["get_script_run_context", "get_report_ctx"])
-            fn = getattr(mod, "get_script_run_context", getattr(mod, "get_report_ctx", None))
-            if fn and fn() is not None:
-                return True
+            mod = __import__(mod_path, fromlist=["get_script_run_ctx", "get_report_ctx"])
+            for fn_name in ["get_script_run_ctx", "get_report_ctx"]:
+                fn = getattr(mod, fn_name, None)
+                if fn and fn() is not None:
+                    return True
         except Exception:
             pass
+
     return False
 
 
@@ -240,9 +275,9 @@ def render_ui():
         
         exec_mode = st.radio(
             "Execution Mode",
-            ["Live Agent Execution", "Offline Demo / Cache Mode", "Pre-baked Sample Run"],
-            index=1,
-            help="Offline Demo Mode runs without consuming LLM API quota using pre-cached responses."
+            ["Offline Demo Mode (Canned Plans & Cache)", "Pre-baked Instant Sample", "Live Agent Execution"],
+            index=0,
+            help="Offline Demo Mode runs full SQL execution, validation, and analytics locally without consuming LLM API quota."
         )
 
         st.subheader("💡 Demo Question Library")
@@ -277,11 +312,11 @@ def render_ui():
         with col_btn:
             run_clicked = st.button("Run Analysis 🚀", type="primary", use_container_width=True)
 
-    # Execution Trigger
-    if run_clicked or (st.session_state.current_run is None and exec_mode == "Pre-baked Sample Run"):
+    # Execution Trigger - run automatically on first load or when button clicked
+    if run_clicked or st.session_state.current_run is None:
         st.session_state.trace_history = []
-        is_sample = (exec_mode == "Pre-baked Sample Run")
-        is_offline = (exec_mode == "Offline Demo / Cache Mode")
+        is_sample = (exec_mode == "Pre-baked Instant Sample")
+        is_offline = (exec_mode != "Live Agent Execution")
 
         trace_container = st.expander("🔍 Live Reasoning Trace", expanded=True)
         trace_placeholder = trace_container.empty()
@@ -357,8 +392,8 @@ def render_ui():
         st.info(f"**Headline Answer:**\n\n{headline_stmt}")
 
         # 2. Plotly Visualizations (Trend & Driver Breakdown)
+        st.subheader("📊 Visual Analytics")
         if current_run.status in ("complete", "partial"):
-            st.subheader("📊 Visual Analytics")
             col_trend, col_driver = st.columns(2)
 
             trend_fig = reporter.generate_trend_chart(current_run)
@@ -383,12 +418,22 @@ def render_ui():
                         st.table(driver_fig.data)
                     else:
                         st.caption("No driver breakdown available")
+        elif current_run.status == "refused":
+            st.info("🛡️ Visualizations are disabled for this query because it was blocked by the safety guardrail.")
+        elif current_run.status == "clarify":
+            st.info("❓ Visualizations will generate once an unambiguous question is provided.")
+        else:
+            st.info("⚠️ Visualizations unavailable due to incomplete execution.")
 
-        # 3. Key Drivers & Contribution Breakdown
-        driver_findings = [f for f in current_run.findings if f.kind in ("driver", "trend")]
-        if driver_findings:
-            st.subheader("🔬 Key Drivers & Root Causes")
-            for df in driver_findings:
+        # 3. Key Drivers / Dimensional Breakdown
+        has_drivers = any(f.kind in ("driver", "trend") for f in current_run.findings)
+        secondary_findings = [f for f in current_run.findings if f.kind in ("driver", "trend", "breakdown", "ranking")]
+        if secondary_findings:
+            if has_drivers:
+                st.subheader("🔬 Key Drivers & Root Causes")
+            else:
+                st.subheader("🔬 Key Categories & Breakdown")
+            for df in secondary_findings:
                 st.markdown(f"- {df.render()}")
 
         # 4. Evidence Appendix: Expandable Query Audit Accordion

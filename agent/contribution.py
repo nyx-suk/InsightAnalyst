@@ -153,6 +153,20 @@ def analyze_contribution(
             )
 
     # Case B: Wide format [dimension, prior, current] or specified columns
+    if period_idx == -1 and len(cols) < 3 and not (prior_col and current_col):
+        # A 2-column query without a time period is an aggregate or multi-metric query, not a comparison
+        return ContributionAnalysis(
+            dimension_name=orig_cols[0] if orig_cols else "dimension",
+            total_prior=0.0,
+            total_current=0.0,
+            total_change=0.0,
+            total_pct_change=None,
+            items=[],
+            is_reconciled=True,
+            reconciliation_error=0.0,
+            tolerance=tolerance
+        )
+
     dim_idx = 0
     p_idx = 1
     c_idx = 2
