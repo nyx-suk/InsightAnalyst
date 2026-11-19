@@ -606,7 +606,7 @@ def run_agent(
         
         # Retrieve domain facts
         docs: List[Any] = []
-        retrieve_fn = getattr(loop_module, "retrieve", None) or retriever or default_retrieve
+        retrieve_fn = retriever or getattr(loop_module, "retrieve", None) or default_retrieve
         try:
             if callable(retrieve_fn):
                 docs = retrieve_fn(question, k=6)
@@ -618,7 +618,12 @@ def run_agent(
             emit_event("plan", f"Retrieval fallback: {e}")
 
         # Generate Plan
-        plan_fn = getattr(loop_module, "create_plan", None) or default_create_plan
+        # If caller explicitly provided llm (e.g. unit tests with mock LLMs), always use default_create_plan with llm
+        if llm is not None:
+            plan_fn = default_create_plan
+        else:
+            plan_fn = getattr(loop_module, "create_plan", None) or default_create_plan
+
         plan: Optional[Plan] = None
         try:
             plan = plan_fn(question, docs, llm=llm)

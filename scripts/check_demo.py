@@ -96,6 +96,60 @@ def verify_numbers_have_query_ids(run: AgentRun) -> Tuple[bool, str]:
     return True, "YES"
 
 
+def verify_metric_relevance(question: str, run: AgentRun) -> Tuple[bool, str]:
+    """
+    Audits semantic correctness: verifies that the executed plan and findings
+    actually evaluate the metric requested in the question (prevents false positives
+    where numbers are traced but the plan evaluated an unrelated metric).
+    """
+    q_lower = question.lower()
+
+    # 1. Infer expected metric from question keywords
+    expected_metric = None
+    if any(k in q_lower for k in ["sales", "revenue", "dollar"]):
+        expected_metric = "revenue"
+    elif any(k in q_lower for k in ["units sold", "units", "quantity"]):
+        expected_metric = "units_sold"
+    elif any(k in q_lower for k in ["how many orders", "order count", "orders placed", "number of orders", "orders were placed"]):
+        expected_metric = "order_count"
+    elif any(k in q_lower for k in ["average order value", "aov", "average order"]):
+        expected_metric = "average_order_value"
+    elif "how many countries" in q_lower or "country count" in q_lower:
+        expected_metric = "country_count"
+
+    if not expected_metric:
+        return True, "YES"
+
+    # 2. Check Plan metric
+    actual_metric = getattr(run.plan, "metric", None)
+    if actual_metric:
+        actual_metric_lower = str(actual_metric).lower()
+        if expected_metric not in actual_metric_lower and actual_metric_lower not in expected_metric:
+            return False, f"Semantic metric mismatch: question asked for '{expected_metric}' but plan evaluated '{actual_metric}'"
+
+    # 3. Check Findings content
+    metric_keywords = {
+        "revenue": ["revenue", "sales", "$", "fell", "rose"],
+        "units_sold": ["units", "units_sold", "quantity", "sold"],
+        "order_count": ["orders", "order_count", "order"],
+        "average_order_value": ["average order", "aov", "value"],
+        "country_count": ["countries", "country"]
+    }
+    keywords = metric_keywords.get(expected_metric, [expected_metric])
+
+    all_texts = []
+    for f in run.findings:
+        all_texts.append(f.statement or f.template or "")
+    for a in run.assumptions:
+        all_texts.append(a)
+
+    combined_text = " ".join(all_texts).lower()
+    if not any(k in combined_text for k in keywords):
+        return False, f"Finding content mismatch: question asked for '{expected_metric}', but findings do not mention {keywords}"
+
+    return True, "YES"
+
+
 def check_demo(questions_file: Path) -> bool:
     """Executes all demo questions in readonly mode and reports on status, queries, retries, and citation audit."""
     questions = load_demo_questions(questions_file)
@@ -150,14 +204,17 @@ def check_demo(questions_file: Path) -> bool:
             query_count = len(run.queries)
             retry_count = len([e for e in run.trace if e.event == "retry"])
             traced, trace_reason = verify_numbers_have_query_ids(run)
+            metric_ok, metric_reason = verify_metric_relevance(question, run)
             traced_str = "YES" if traced else "NO"
 
-            passed = (status == "complete") and traced
+            passed = (status == "complete") and traced and metric_ok
             if not passed:
                 if status != "complete":
                     details = f"Status '{status}': {run.error or 'Incomplete'}"
-                else:
+                elif not traced:
                     details = f"Audit failed: {trace_reason}"
+                else:
+                    details = f"Semantic audit failed: {metric_reason}"
             else:
                 details = f"Passed ({len(run.findings)} findings verified)"
 

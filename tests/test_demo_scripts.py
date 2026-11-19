@@ -11,6 +11,7 @@ from contracts import AgentRun, Finding, Plan, QueryResult
 from scripts.check_demo import (
     load_demo_questions,
     verify_numbers_have_query_ids,
+    verify_metric_relevance,
     check_demo
 )
 from scripts.warm_cache import warm_cache_for_questions
@@ -126,6 +127,49 @@ class TestDemoScripts(unittest.TestCase):
         ok, msg = verify_numbers_have_query_ids(run)
         self.assertFalse(ok)
         self.assertIn("No findings generated", msg)
+
+    def test_verify_metric_relevance_valid(self):
+        """Questions matching plan metric and finding text must pass semantic audit."""
+        run = AgentRun(
+            question="Why did sales drop in the South region last month?",
+            plan=Plan(metric="revenue", time_window="last_complete_month"),
+            findings=[
+                Finding(
+                    id="F1",
+                    kind="headline",
+                    template="Overall revenue fell by 52850.03 (-7.69%) [Q1]",
+                    values={"val": 52850.03},
+                    query_id="Q1",
+                    statement="Overall revenue fell by 52850.03 (-7.69%) [Q1]"
+                )
+            ],
+            status="complete"
+        )
+        ok, msg = verify_metric_relevance(run.question, run)
+        self.assertTrue(ok)
+        self.assertEqual(msg, "YES")
+
+    def test_verify_metric_relevance_mismatch(self):
+        """Questions with mismatched plan metric (e.g. sales vs country_count) must fail semantic audit."""
+        run = AgentRun(
+            question="Why did sales drop in the South region last month?",
+            plan=Plan(metric="country_count", time_window="current"),
+            findings=[
+                Finding(
+                    id="F1",
+                    kind="headline",
+                    template="Overall country_count fell by 21.0 [Q1]",
+                    values={"val": 21.0},
+                    query_id="Q1",
+                    statement="Overall country_count fell by 21.0 [Q1]"
+                )
+            ],
+            status="complete"
+        )
+        ok, msg = verify_metric_relevance(run.question, run)
+        self.assertFalse(ok)
+        self.assertIn("Semantic metric mismatch", msg)
+        self.assertIn("country_count", msg)
 
     def test_warm_cache_and_check_demo_flow(self):
         """End-to-end test of warm_cache -> check_demo in readonly cache mode."""
