@@ -262,14 +262,25 @@ def generate_markdown_report(run_input: Union[AgentRun, Dict[str, Any]]) -> str:
     else:
         if run.status in ("complete", "partial"):
             sections.append("*(No secondary drill-down drivers were required for this single-step analysis)*\n")
+        elif run.status == "refused":
+            sections.append("*(No driver breakdown available: Request was blocked by safety guardrail)*\n")
+        elif run.status == "clarify":
+            sections.append("*(No driver breakdown available: Question requires user clarification)*\n")
         else:
             sections.append("*(No driver breakdown available due to incomplete execution)*\n")
 
     # 3. Interactive Visualizations
     sections.append("## 3. Interactive Visualizations\n")
-    sections.append("The report includes two analytical visual perspectives:")
-    sections.append("- **Trend Analysis Chart**: Illustrates period-over-period metric variance across target and comparison windows.")
-    sections.append("- **Driver Breakdown Chart**: Displays ranked dimensional contributions (e.g. products, categories, or regions) isolating root causes.\n")
+    if run.status in ("complete", "partial"):
+        sections.append("The report includes two analytical visual perspectives:")
+        sections.append("- **Trend Analysis Chart**: Illustrates period-over-period metric variance across target and comparison windows.")
+        sections.append("- **Driver Breakdown Chart**: Displays ranked dimensional contributions (e.g. products, categories, or regions) isolating root causes.\n")
+    elif run.status == "refused":
+        sections.append("*(Visualizations omitted: Destructive database modifications are blocked by safety guardrails)*\n")
+    elif run.status == "clarify":
+        sections.append("*(Visualizations omitted: Please clarify your business question before charts can be generated)*\n")
+    else:
+        sections.append("*(Visualizations omitted due to incomplete execution)*\n")
 
     # 4. Assumptions & Business Rules
     sections.append("## 4. Assumptions & Business Rules\n")
