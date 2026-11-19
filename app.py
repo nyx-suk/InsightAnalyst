@@ -392,8 +392,8 @@ def render_ui():
         st.info(f"**Headline Answer:**\n\n{headline_stmt}")
 
         # 2. Plotly Visualizations (Trend & Driver Breakdown)
+        st.subheader("📊 Visual Analytics")
         if current_run.status in ("complete", "partial"):
-            st.subheader("📊 Visual Analytics")
             col_trend, col_driver = st.columns(2)
 
             trend_fig = reporter.generate_trend_chart(current_run)
@@ -418,6 +418,12 @@ def render_ui():
                         st.table(driver_fig.data)
                     else:
                         st.caption("No driver breakdown available")
+        elif current_run.status == "refused":
+            st.info("🛡️ Visualizations are disabled for this query because it was blocked by the safety guardrail.")
+        elif current_run.status == "clarify":
+            st.info("❓ Visualizations will generate once an unambiguous question is provided.")
+        else:
+            st.info("⚠️ Visualizations unavailable due to incomplete execution.")
 
         # 3. Key Drivers & Contribution Breakdown
         driver_findings = [f for f in current_run.findings if f.kind in ("driver", "trend")]
