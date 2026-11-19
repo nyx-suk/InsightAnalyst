@@ -276,7 +276,7 @@ python3 -m unittest discover -v
 ---
 
 ## Contributors
-1. **Srigadde Sukrutha** (1CR24CS186) — *Person A: Agent Brain (Contracts, LLM Wrapper, Planner, Loop, Narrative, Retrieval)*
-2. **Harini RK** (1CR24CS071) — *Person B: Data & Delivery (Database, Executor, Validator, Reporter, UI)*
+1. **Srigadde Sukrutha** (1CR24CS186) 
+2. **Harini RK** (1CR24CS071) 
 3. **Archanaa A M** (1CR24CS030)
 4. **Hannan Israili** (1CR24CS070)
