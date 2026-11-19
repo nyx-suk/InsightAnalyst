@@ -134,7 +134,18 @@ def _partition_validations_by_query(queries: List[QueryResult], validations: Lis
     if not queries or not validations:
         return mapping
 
-    # Check if validations already carry query_id in reason or check_name
+    # 1. Match by explicit query_id attribute on ValidationResult
+    has_tagged = any(getattr(v, "query_id", None) for v in validations)
+    if has_tagged:
+        for v in validations:
+            qid = getattr(v, "query_id", None)
+            if qid in mapping:
+                mapping[qid].append(v)
+            elif queries:
+                mapping[queries[0].query_id].append(v)
+        return mapping
+
+    # 2. Check if validations already carry query_id in reason or check_name
     matched_explicit = False
     for val in validations:
         for q in queries:
@@ -146,7 +157,7 @@ def _partition_validations_by_query(queries: List[QueryResult], validations: Lis
     if matched_explicit:
         return mapping
 
-    # If validations count matches an even slice per query (e.g., 4 checks each)
+    # 3. If validations count matches an even slice per query (e.g., 4 checks each)
     num_queries = len(queries)
     if len(validations) % num_queries == 0:
         chunk_size = len(validations) // num_queries
@@ -224,41 +235,64 @@ def generate_markdown_report(run_input: Union[AgentRun, Dict[str, Any]]) -> str:
             else:
                 sections.append("Analysis completed. No conclusive primary finding was identified.\n")
 
-    # 2. Key Drivers
+    # 2. Key Drivers / Dimensional Breakdown
     sections.append("## 2. Key Drivers\n")
-    driver_findings = [f for f in run.findings if f.kind in ("driver", "trend")]
+    has_drivers = any(f.kind in ("driver", "trend") for f in run.findings)
+    has_breakdowns = any(f.kind in ("breakdown", "ranking") for f in run.findings)
+    driver_findings = [f for f in run.findings if f.kind in ("driver", "trend", "breakdown", "ranking")]
+
     if driver_findings:
         for df in driver_findings:
             stmt = df.render()
             sections.append(f"- {stmt}")
         sections.append("")
 
-        # Driver Contribution Summary Table if structured values exist
-        structured_drivers = [
-            f for f in driver_findings
-            if f.values and ("abs_change" in f.values or "contribution_pct" in f.values or "val" in f.values)
-        ]
-        if structured_drivers:
-            table_cols = ["Dimension", "Direction", "Change", "% Change", "Contribution", "Query"]
-            table_rows = []
-            for sd in structured_drivers:
-                dim = sd.values.get("dimension_value") or sd.values.get("dimension_name") or sd.id
-                direction = sd.values.get("direction", "-")
-                abs_chg = sd.values.get("abs_change", sd.values.get("val", "-"))
-                if isinstance(abs_chg, float):
-                    abs_chg = f"{abs_chg:,.2f}"
-                pct_chg = sd.values.get("pct_change", "-")
-                if isinstance(pct_chg, float):
-                    pct_chg = f"{pct_chg:+.2f}%"
-                contrib = sd.values.get("contribution_pct", "-")
-                if isinstance(contrib, float):
-                    contrib = f"{contrib:.1f}%"
-                qid = f"[{sd.query_id}]" if sd.query_id else "-"
-                table_rows.append([dim, direction, abs_chg, pct_chg, contrib, qid])
-            
-            sections.append("### Driver Breakdown Summary\n")
-            sections.append(format_markdown_table(table_cols, table_rows))
-            sections.append("")
+        if has_drivers:
+            # Driver Contribution Summary Table if structured values exist
+            structured_drivers = [
+                f for f in driver_findings
+                if f.values and ("abs_change" in f.values or "contribution_pct" in f.values or "val" in f.values) and f.kind in ("driver", "trend")
+            ]
+            if structured_drivers:
+                table_cols = ["Dimension", "Direction", "Change", "% Change", "Contribution", "Query"]
+                table_rows = []
+                for sd in structured_drivers:
+                    dim = sd.values.get("dimension_value") or sd.values.get("dimension_name") or sd.id
+                    direction = sd.values.get("direction", "-")
+                    abs_chg = sd.values.get("abs_change", sd.values.get("val", "-"))
+                    if isinstance(abs_chg, float):
+                        abs_chg = f"{abs_chg:,.2f}"
+                    pct_chg = sd.values.get("pct_change", "-")
+                    if isinstance(pct_chg, float):
+                        pct_chg = f"{pct_chg:+.2f}%"
+                    contrib = sd.values.get("contribution_pct", "-")
+                    if isinstance(contrib, float):
+                        contrib = f"{contrib:.1f}%"
+                    qid = f"[{sd.query_id}]" if sd.query_id else "-"
+                    table_rows.append([dim, direction, abs_chg, pct_chg, contrib, qid])
+                
+                sections.append("### Driver Breakdown Summary\n")
+                sections.append(format_markdown_table(table_cols, table_rows))
+                sections.append("")
+        elif has_breakdowns:
+            # Dimensional Breakdown Summary Table for single-period descriptive queries
+            structured_breakdowns = [f for f in driver_findings if f.kind in ("breakdown", "ranking") and f.values]
+            if structured_breakdowns:
+                metric_col_header = "Units Sold" if "unit" in (run.plan.metric if run.plan else "").lower() else "Value"
+                table_cols = ["Category / Entity", metric_col_header, "% of Total", "Query"]
+                table_rows = []
+                for sb in structured_breakdowns:
+                    dim = sb.values.get("dim") or sb.values.get("dimension") or sb.id
+                    val = sb.values.get("val") or sb.values.get("metric_val", "-")
+                    if isinstance(val, (int, float)):
+                        val = f"{val:,.0f}" if float(val).is_integer() else f"{val:,.2f}"
+                    share = sb.values.get("share_pct", "-")
+                    qid = f"[{sb.query_id}]" if sb.query_id else "-"
+                    table_rows.append([str(dim), str(val), str(share), qid])
+                
+                sections.append("### Category Breakdown Summary\n")
+                sections.append(format_markdown_table(table_cols, table_rows))
+                sections.append("")
     else:
         if run.status in ("complete", "partial"):
             sections.append("*(No secondary drill-down drivers were required for this single-step analysis)*\n")
@@ -272,9 +306,13 @@ def generate_markdown_report(run_input: Union[AgentRun, Dict[str, Any]]) -> str:
     # 3. Interactive Visualizations
     sections.append("## 3. Interactive Visualizations\n")
     if run.status in ("complete", "partial"):
-        sections.append("The report includes two analytical visual perspectives:")
-        sections.append("- **Trend Analysis Chart**: Illustrates period-over-period metric variance across target and comparison windows.")
-        sections.append("- **Driver Breakdown Chart**: Displays ranked dimensional contributions (e.g. products, categories, or regions) isolating root causes.\n")
+        if has_drivers or any(f.kind == "trend" for f in run.findings):
+            sections.append("The report includes two analytical visual perspectives:")
+            sections.append("- **Trend Analysis Chart**: Illustrates period-over-period metric variance across target and comparison windows.")
+            sections.append("- **Driver Breakdown Chart**: Displays ranked dimensional contributions isolating root causes.\n")
+        else:
+            sections.append("The report includes dimensional breakdown analytics:")
+            sections.append("- **Category Breakdown Chart**: Displays ranked category contributions to the target metric.\n")
     elif run.status == "refused":
         sections.append("*(Visualizations omitted: Destructive database modifications are blocked by safety guardrails)*\n")
     elif run.status == "clarify":
@@ -284,26 +322,43 @@ def generate_markdown_report(run_input: Union[AgentRun, Dict[str, Any]]) -> str:
 
     # 4. Assumptions & Business Rules
     sections.append("## 4. Assumptions & Business Rules\n")
-    default_assumptions = [
-        "**Time Anchoring**: Relative dates are anchored to the last complete calendar month in the dataset (September 2023).",
-        "**Revenue Formula**: Revenue is strictly calculated as `UnitPrice * Quantity * (1 - Discount)` from `[Order Details]`; `Freight` shipping fees are excluded.",
-        "**Geographic Mapping**: Customer countries map to sales regions via the `dim_country_region` mapping table joined on `Customers.Country`."
-    ]
-    for da in default_assumptions:
-        sections.append(f"- {da}")
+    assumptions_to_show = []
 
-    # Add custom plan assumptions
-    custom_assumptions = []
+    # Time anchoring
+    assumptions_to_show.append("**Time Anchoring**: Relative dates are anchored to the last complete calendar month in the dataset (September 2023).")
+
+    # Metric-specific definition
+    metric_str = (run.plan.metric if run.plan and run.plan.metric else "").lower()
+    queries_sql = " ".join(q.sql for q in run.queries).lower()
+
+    if "unit" in metric_str or "quantity" in metric_str or ("quantity" in queries_sql and "unitprice" not in queries_sql):
+        assumptions_to_show.append("**Units Sold Formula**: Total units sold is calculated as `SUM(Quantity)` from `[Order Details]`.")
+    elif "order" in metric_str or "order_count" in metric_str:
+        assumptions_to_show.append("**Order Count**: Total orders are calculated as `COUNT(DISTINCT OrderID)` from `Orders`.")
+    elif "revenue" in metric_str or "sale" in metric_str or "unitprice" in queries_sql:
+        assumptions_to_show.append("**Revenue Formula**: Revenue is strictly calculated as `UnitPrice * Quantity * (1 - Discount)` from `[Order Details]`; `Freight` shipping fees are excluded.")
+
+    # Geographic mapping (only if region or country is involved)
+    is_geo = (
+        (run.plan and run.plan.filters and any(k in run.plan.filters for k in ("region", "country"))) or
+        any("dim_country_region" in q.sql.lower() or "region" in q.sql.lower() or "country" in q.sql.lower() for q in run.queries)
+    )
+    if is_geo:
+        assumptions_to_show.append("**Geographic Mapping**: Customer countries map to sales regions via the `dim_country_region` mapping table joined on `Customers.Country`.")
+
+    # Add custom plan assumptions without duplication
     if run.plan and run.plan.assumptions:
-        custom_assumptions.extend(run.plan.assumptions)
-    for a in run.assumptions:
-        # Exclude duplicated narrative summaries or raw time window markers
-        if not a.startswith("Narrative Summary:") and not a.startswith("Time window spec:"):
-            if a not in custom_assumptions:
-                custom_assumptions.append(a)
+        for ca in run.plan.assumptions:
+            if not any(ca.lower() in a.lower() or a.lower() in ca.lower() for a in assumptions_to_show):
+                assumptions_to_show.append(ca)
 
-    for ca in custom_assumptions:
-        sections.append(f"- {ca}")
+    for a in run.assumptions:
+        if not a.startswith("Narrative Summary:") and not a.startswith("Time window spec:"):
+            if not any(a.lower() in existing.lower() or existing.lower() in a.lower() for existing in assumptions_to_show):
+                assumptions_to_show.append(a)
+
+    for a in assumptions_to_show:
+        sections.append(f"- {a}")
     sections.append("")
 
     # 5. Evidence Appendix
@@ -413,7 +468,7 @@ def generate_trend_chart(run_input: Union[AgentRun, Dict[str, Any]]) -> Any:
 
     if HAS_PLOTLY:
         fig = go.Figure()
-        if chart_data:
+        if len(chart_data) >= 2:
             x_vals = [d["period"] for d in chart_data]
             y_vals = [d["value"] for d in chart_data]
             text_labels = [f"{v:,.2f}" if abs(v) >= 1000 else f"{v:.2f}" for v in y_vals]
@@ -430,17 +485,41 @@ def generate_trend_chart(run_input: Union[AgentRun, Dict[str, Any]]) -> Any:
                 ),
                 hovertemplate="<b>%{x}</b><br>" + metric_name + ": %{y:,.2f}<extra></extra>"
             ))
+            fig.update_layout(
+                title=dict(text=f"<b>{chart_title}</b>", font=dict(size=16, color="#0f172a")),
+                xaxis=dict(title=x_label, tickfont=dict(size=12)),
+                yaxis=dict(title=y_label, tickformat=",.0f", tickfont=dict(size=12)),
+                template="plotly_white",
+                margin=dict(l=40, r=40, t=50, b=40),
+                height=380
+            )
         else:
-            fig.add_annotation(text="No trend data available", showarrow=False, font=dict(size=14, color="#64748b"))
-
-        fig.update_layout(
-            title=dict(text=f"<b>{chart_title}</b>", font=dict(size=16, color="#0f172a")),
-            xaxis=dict(title=x_label, tickfont=dict(size=12)),
-            yaxis=dict(title=y_label, tickformat=",.0f", tickfont=dict(size=12)),
-            template="plotly_white",
-            margin=dict(l=40, r=40, t=50, b=40),
-            height=380
-        )
+            # Check if Q2 has category breakdown
+            breakdown_query = next((q for q in run.queries if q.query_id != "Q1" and q.rows and not q.error), None)
+            if breakdown_query and len(breakdown_query.columns) >= 2:
+                labels = [str(r[0]) for r in breakdown_query.rows]
+                vals = [_safe_float(r[1]) for r in breakdown_query.rows]
+                fig.add_trace(go.Pie(
+                    labels=labels,
+                    values=vals,
+                    hole=0.45,
+                    textinfo="label+percent",
+                    marker=dict(colors=["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#6366f1"]),
+                    hovertemplate="<b>%{label}</b><br>Share: %{percent}<br>" + metric_name + ": %{value:,.0f}<extra></extra>"
+                ))
+                fig.update_layout(
+                    title=dict(text=f"<b>{metric_name} by Category (Share)</b>", font=dict(size=16, color="#0f172a")),
+                    template="plotly_white",
+                    margin=dict(l=40, r=40, t=50, b=40),
+                    height=380
+                )
+            else:
+                fig.add_annotation(text="Single-period aggregate (no period comparison)", showarrow=False, font=dict(size=14, color="#64748b"))
+                fig.update_layout(
+                    title=dict(text=f"<b>{chart_title}</b>", font=dict(size=16, color="#0f172a")),
+                    template="plotly_white",
+                    height=380
+                )
         return fig
 
     return ChartSpec(
@@ -506,9 +585,14 @@ def generate_driver_chart(run_input: Union[AgentRun, Dict[str, Any]]) -> Any:
                 if val is not None:
                     chart_data.append({"entity": str(dim_name), "value": float(val)})
 
-    chart_title = f"Driver Breakdown: Top Contributors ({metric_name})"
+    has_drivers = any(f.kind in ("driver", "trend") for f in run.findings)
     x_label = metric_name
-    y_label = "Contributor"
+    if has_drivers:
+        chart_title = f"Driver Breakdown: Top Contributors ({metric_name})"
+        y_label = "Contributor"
+    else:
+        chart_title = f"Category Breakdown: Top Categories ({metric_name})"
+        y_label = "Category"
 
     if HAS_PLOTLY:
         fig = go.Figure()

@@ -425,11 +425,15 @@ def render_ui():
         else:
             st.info("⚠️ Visualizations unavailable due to incomplete execution.")
 
-        # 3. Key Drivers & Contribution Breakdown
-        driver_findings = [f for f in current_run.findings if f.kind in ("driver", "trend")]
-        if driver_findings:
-            st.subheader("🔬 Key Drivers & Root Causes")
-            for df in driver_findings:
+        # 3. Key Drivers / Dimensional Breakdown
+        has_drivers = any(f.kind in ("driver", "trend") for f in current_run.findings)
+        secondary_findings = [f for f in current_run.findings if f.kind in ("driver", "trend", "breakdown", "ranking")]
+        if secondary_findings:
+            if has_drivers:
+                st.subheader("🔬 Key Drivers & Root Causes")
+            else:
+                st.subheader("🔬 Key Categories & Breakdown")
+            for df in secondary_findings:
                 st.markdown(f"- {df.render()}")
 
         # 4. Evidence Appendix: Expandable Query Audit Accordion
