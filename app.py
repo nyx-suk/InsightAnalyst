@@ -137,14 +137,39 @@ def execute_analysis(
 
 
 def _is_running_in_streamlit() -> bool:
-    """Checks if currently executing inside an active Streamlit runtime."""
+    """Checks if currently executing inside an active Streamlit runtime across all versions."""
     if not HAS_STREAMLIT:
         return False
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_context
-        return get_script_run_context() is not None
-    except Exception:
-        return False
+    # Check Streamlit internal flag
+    if getattr(st, "_is_running_with_streamlit", False):
+        return True
+    # Check command-line invocation arguments
+    if any("streamlit" in str(arg).lower() for arg in sys.argv):
+        return True
+    # Check ScriptRunContext across all Streamlit version module paths
+    for mod_path in [
+        "streamlit.runtime.scriptrunner",
+        "streamlit.scriptrunner",
+        "streamlit.report_thread"
+    ]:
+        try:
+            mod = __import__(mod_path, fromlist=["get_script_run_context", "get_report_ctx"])
+            fn = getattr(mod, "get_script_run_context", getattr(mod, "get_report_ctx", None))
+            if fn and fn() is not None:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _safe_rerun():
+    """Triggers Streamlit rerun safely across all versions."""
+    if not HAS_STREAMLIT:
+        return
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 
 def render_ui():
@@ -226,7 +251,7 @@ def render_ui():
                 st.session_state.question_text = preset["question"]
                 st.session_state.current_run = None
                 st.session_state.trace_history = []
-                st.rerun()
+                _safe_rerun()
 
         st.divider()
         st.subheader("🛡️ Trust Architecture")
